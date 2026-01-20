@@ -6,22 +6,23 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title TAOCasino
- * @notice P2P betting game on Bittensor EVM with dual-position betting, referrals, and rapid mode
+ * @notice P2P Underdog betting game on Bittensor EVM - the minority side wins!
  * @dev Features:
+ *   - Underdog game mode (less money wins - bet against the crowd!)
  *   - Dual-position betting (bet on BOTH Red AND Blue simultaneously)
  *   - Referral system (referrers earn 10% of referee's platform fees)
  *   - Rapid mode (10-minute games) alongside regular games
  *   - Underdog bonus (reduced fee when betting on smaller side)
  *   - Leaderboard tracking for top winners
  *   - Native TAO betting
+ *   - Solvency protection (fees locked until game resolves)
  */
 contract TAOCasino is ReentrancyGuard, Ownable {
 
     // ==================== ENUMS ====================
     
     enum GameType {
-        Classic,    // More money wins (majority)
-        Underdog    // Less money wins (minority)
+        Underdog    // Less money wins (minority) - the only game type
     }
     
     enum GameSpeed {
@@ -107,6 +108,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     error NotEnoughParticipation();
     error InvalidReferralCode();
     error CannotReferSelf();
+    error BetTooSmall();
+    error ContractPaused();
+    error GameHasBets();
 
     // ==================== STATE VARIABLES ====================
     
@@ -119,8 +123,21 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     uint256 public constant FEE_DENOMINATOR = 10000;
     uint256 public constant TOKEN_DECIMALS = 18; // TAO uses 18 decimals
     
-    // Accumulated fees in native TAO
+    // Minimum bet amount to prevent dust attacks
+    uint256 public minBetAmount = 0.001 ether;  // 0.001 TAO minimum bet
+    
+    // Circuit breaker - pauses new games but lets active games complete
+    bool public paused = false;
+    
+    // Accumulated fees in native TAO (only from finalized games)
     uint256 public accumulatedFees;
+    
+    // Per-game fee tracking for solvency (fees locked until game finalizes)
+    mapping(uint256 => uint256) public gameFees;
+    // Per-game referral rewards tracking for clawback on cancel
+    mapping(uint256 => uint256) public gameReferralRewards;
+    // Per-game per-referrer rewards (only transferred to pendingReferralRewards on game resolution)
+    mapping(uint256 => mapping(address => uint256)) public gamePendingReferralRewards;
     
     // Game timing parameters (in seconds)
     uint256 public regularBettingDuration = 105 minutes;
@@ -135,9 +152,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     uint256 public minPoolSize = 1 ether;        // 1 TAO minimum for regular
     uint256 public rapidMinPoolSize = 0.5 ether; // 0.5 TAO minimum for rapid
     
-    // Current active games (one Classic, one Underdog can run simultaneously)
-    uint256 public currentClassicGameId = 0;
-    uint256 public currentUnderdogGameId = 0;
+    // Current active game
+    uint256 public currentGameId = 0;
     
     // Mappings
     mapping(uint256 => Game) public games;
@@ -218,6 +234,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     
     event GameCancelled(uint256 indexed gameId, string reason);
     event RefundClaimed(uint256 indexed gameId, address indexed bettor, Side side, uint256 amount);
+    event FeesReleased(uint256 indexed gameId, uint256 platformFees, uint256 referralFees);
+    event GameTied(uint256 indexed gameId, uint256 redPool, uint256 bluePool);
+    event ContractPausedEvent(bool isPaused);
 
     // ==================== CONSTRUCTOR ====================
     
@@ -259,15 +278,37 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         emit ReferralRewardsClaimed(msg.sender, reward);
     }
+    
+    /**
+     * @notice Transfer referral rewards from a resolved game to claimable balance
+     * @dev Referral rewards are locked until game resolves for solvency
+     * @param _gameId The game ID to claim referral rewards from
+     */
+    function releaseGameReferralRewards(uint256 _gameId) external {
+        if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
+        
+        Game storage game = games[_gameId];
+        
+        // Only allow release from resolved games (not cancelled)
+        require(game.hasWinner && (game.phase == GamePhase.Resolved || game.phase == GamePhase.Finalized), 
+                "Game not resolved");
+        
+        uint256 reward = gamePendingReferralRewards[_gameId][msg.sender];
+        require(reward > 0, "No rewards for this game");
+        
+        // Transfer from game-specific to global pending
+        gamePendingReferralRewards[_gameId][msg.sender] = 0;
+        pendingReferralRewards[msg.sender] += reward;
+        referrals[msg.sender].totalEarnings += reward;
+    }
 
     // ==================== MAIN FUNCTIONS ====================
     
-    function startNewGame(GameType _gameType, GameSpeed _gameSpeed) external {
-        // Check by game type - Classic and Underdog are separate slots
-        uint256 currentId = _gameType == GameType.Classic ? currentClassicGameId : currentUnderdogGameId;
+    function startNewGame(GameSpeed _gameSpeed) external {
+        if (paused) revert ContractPaused();
         
-        if (currentId > 0) {
-            Game storage prevGame = games[currentId];
+        if (currentGameId > 0) {
+            Game storage prevGame = games[currentGameId];
             if (prevGame.phase == GamePhase.Betting) revert GameStillActive();
             if (prevGame.phase == GamePhase.Calculating) revert GameStillActive();
         }
@@ -279,7 +320,7 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         games[gameId] = Game({
             id: gameId,
-            gameType: _gameType,
+            gameType: GameType.Underdog,
             gameSpeed: _gameSpeed,
             phase: GamePhase.Betting,
             redPool: 0,
@@ -294,14 +335,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             hasWinner: false
         });
         
-        // Track by game type - each type has its own slot
-        if (_gameType == GameType.Classic) {
-            currentClassicGameId = gameId;
-        } else {
-            currentUnderdogGameId = gameId;
-        }
+        currentGameId = gameId;
         
-        emit GameCreated(gameId, _gameType, _gameSpeed, startTime, endTime);
+        emit GameCreated(gameId, GameType.Underdog, _gameSpeed, startTime, endTime);
     }
     
     /**
@@ -317,6 +353,7 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     ) external payable nonReentrant {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         if (msg.value == 0) revert InvalidBetAmount();
+        if (msg.value < minBetAmount) revert BetTooSmall();
         
         Game storage game = games[_gameId];
         
@@ -343,34 +380,37 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         uint256 feeAmount = (_amount * feeRate) / FEE_DENOMINATOR;
         uint256 netAmount = _amount - feeAmount;
+        uint256 referralReward = 0;
         
-        // Handle referral
+        // Handle referral - rewards are held until game resolves (for solvency)
         address referrer = existingBet.referrer;
         if (bytes(_referralCode).length > 0 && referrer == address(0)) {
             referrer = validateReferralCode(_referralCode);
             if (referrer != address(0) && referrer != msg.sender) {
-                uint256 referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
+                referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
                 feeAmount -= referralReward;
                 
-                pendingReferralRewards[referrer] += referralReward;
+                // Store in game-specific pending (not global) until game resolves
+                gamePendingReferralRewards[_gameId][referrer] += referralReward;
+                gameReferralRewards[_gameId] += referralReward;
                 referrals[referrer].totalReferred++;
-                referrals[referrer].totalEarnings += referralReward;
                 
                 emit ReferralRewardEarned(referrer, msg.sender, referralReward);
             }
         } else if (referrer != address(0)) {
             // Existing referrer on this bet
-            uint256 referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
+            referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
             feeAmount -= referralReward;
             
-            pendingReferralRewards[referrer] += referralReward;
-            referrals[referrer].totalEarnings += referralReward;
+            // Store in game-specific pending (not global) until game resolves
+            gamePendingReferralRewards[_gameId][referrer] += referralReward;
+            gameReferralRewards[_gameId] += referralReward;
             
             emit ReferralRewardEarned(referrer, msg.sender, referralReward);
         }
         
-        // Track fees
-        accumulatedFees += feeAmount;
+        // Track fees per game (NOT in accumulatedFees until game finalizes)
+        gameFees[_gameId] += feeAmount;
         gameBalance[_gameId] += netAmount;
         
         // Check if this is a new bettor on this side
@@ -428,20 +468,27 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             return;
         }
         
-        Side winner;
-        
-        if (game.gameType == GameType.Classic) {
-            // Classic: More money wins
-            winner = game.redPool >= game.bluePool ? Side.Red : Side.Blue;
-        } else {
-            // Underdog: Less money wins
-            winner = game.redPool <= game.bluePool ? Side.Red : Side.Blue;
+        // Check for exact tie - refund everyone
+        if (game.redPool == game.bluePool) {
+            emit GameTied(_gameId, game.redPool, game.bluePool);
+            _cancelGame(_gameId, "Exact tie - refunding all bets");
+            return;
         }
+        
+        // Underdog: Less money wins (minority side wins)
+        Side winner = game.redPool < game.bluePool ? Side.Red : Side.Blue;
         
         game.winningSide = winner;
         game.hasWinner = true;
         game.phase = GamePhase.Resolved;
         game.resolvedTime = block.timestamp;
+        
+        // Release fees to accumulatedFees now that game is resolved (safe to withdraw)
+        uint256 releasedFees = gameFees[_gameId];
+        uint256 releasedReferralRewards = gameReferralRewards[_gameId];
+        accumulatedFees += releasedFees;
+        
+        emit FeesReleased(_gameId, releasedFees, releasedReferralRewards);
         
         emit GameResolved(
             _gameId,
@@ -461,6 +508,29 @@ contract TAOCasino is ReentrancyGuard, Ownable {
      * @param _side Side to claim from (must be winning side)
      */
     function claimWinnings(uint256 _gameId, Side _side) external nonReentrant {
+        _claimWinnings(_gameId, _side);
+    }
+    
+    /**
+     * @notice Convenience function to claim both sides at once
+     * @dev Now uses internal function calls to prevent reentrancy
+     */
+    function claimAllWinnings(uint256 _gameId) external nonReentrant {
+        SideBet storage redBet = sideBets[_gameId][msg.sender][Side.Red];
+        SideBet storage blueBet = sideBets[_gameId][msg.sender][Side.Blue];
+        
+        if (redBet.amount > 0 && !redBet.claimed) {
+            _claimWinnings(_gameId, Side.Red);
+        }
+        if (blueBet.amount > 0 && !blueBet.claimed) {
+            _claimWinnings(_gameId, Side.Blue);
+        }
+    }
+    
+    /**
+     * @notice Internal function to claim winnings (shared by claimWinnings and claimAllWinnings)
+     */
+    function _claimWinnings(uint256 _gameId, Side _side) internal {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         
         Game storage game = games[_gameId];
@@ -517,31 +587,23 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, payout);
     }
     
-    /**
-     * @notice Convenience function to claim both sides at once
-     */
-    function claimAllWinnings(uint256 _gameId) external {
-        SideBet storage redBet = sideBets[_gameId][msg.sender][Side.Red];
-        SideBet storage blueBet = sideBets[_gameId][msg.sender][Side.Blue];
-        
-        if (redBet.amount > 0 && !redBet.claimed) {
-            this.claimWinnings(_gameId, Side.Red);
-        }
-        if (blueBet.amount > 0 && !blueBet.claimed) {
-            this.claimWinnings(_gameId, Side.Blue);
-        }
-    }
-    
     // ==================== INTERNAL FUNCTIONS ====================
     
     function _cancelGame(uint256 _gameId, string memory _reason) internal {
         Game storage game = games[_gameId];
         
-        // Return fees to game balance for refunds
-        uint256 fees = (gameBalance[_gameId] * platformFee) / (FEE_DENOMINATOR - platformFee);
-        gameBalance[_gameId] += fees;
+        // Return ALL fees (platform + referral) to game balance for full refunds
+        // This ensures solvency - all original bet amounts can be refunded
+        uint256 platformFeesToReturn = gameFees[_gameId];
+        uint256 referralFeesToReturn = gameReferralRewards[_gameId];
         
-        if (accumulatedFees >= fees) accumulatedFees -= fees;
+        gameBalance[_gameId] += platformFeesToReturn + referralFeesToReturn;
+        
+        // Clear the per-game fee tracking (funds returned to players)
+        gameFees[_gameId] = 0;
+        gameReferralRewards[_gameId] = 0;
+        // Note: gamePendingReferralRewards[_gameId][referrer] is NOT transferred to global
+        // This means referrers don't earn from cancelled games
         
         uint256 totalPool = game.redPool + game.bluePool;
         game.totalLiquidity = totalPool;
@@ -595,14 +657,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return games[_gameId];
     }
     
-    function getCurrentClassicGame() external view returns (Game memory) {
-        if (currentClassicGameId == 0) revert NoActiveGame();
-        return games[currentClassicGameId];
-    }
-    
-    function getCurrentUnderdogGame() external view returns (Game memory) {
-        if (currentUnderdogGameId == 0) revert NoActiveGame();
-        return games[currentUnderdogGameId];
+    function getCurrentGame() external view returns (Game memory) {
+        if (currentGameId == 0) revert NoActiveGame();
+        return games[currentGameId];
     }
     
     /**
@@ -728,6 +785,14 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return gameBalance[_gameId];
     }
     
+    function getGameFees(uint256 _gameId) external view returns (uint256 platformFees, uint256 referralFees) {
+        return (gameFees[_gameId], gameReferralRewards[_gameId]);
+    }
+    
+    function getGamePendingReferralReward(uint256 _gameId, address _referrer) external view returns (uint256) {
+        return gamePendingReferralRewards[_gameId][_referrer];
+    }
+    
     function isUnderdogSide(uint256 _gameId, Side _side) external view returns (bool) {
         Game storage game = games[_gameId];
         uint256 totalPool = game.redPool + game.bluePool;
@@ -769,9 +834,19 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     }
     
     function setMinParticipation(uint256 _minBets, uint256 _minPool, uint256 _rapidMinPool) external onlyOwner {
+        // Reasonable bounds to prevent owner from making games impossible
+        require(_minBets <= 100, "Min bets cannot exceed 100");
+        require(_minPool <= 100 ether, "Min pool cannot exceed 100 TAO");
+        require(_rapidMinPool <= 50 ether, "Rapid min pool cannot exceed 50 TAO");
+        
         minTotalBets = _minBets;
         minPoolSize = _minPool;
         rapidMinPoolSize = _rapidMinPool;
+    }
+    
+    function setMinBetAmount(uint256 _minBet) external onlyOwner {
+        require(_minBet <= 1 ether, "Min bet cannot exceed 1 TAO");
+        minBetAmount = _minBet;
     }
     
     function withdrawFees() external onlyOwner {
@@ -788,13 +863,30 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return accumulatedFees;
     }
     
+    /**
+     * @notice Emergency cancel a game - only allowed if NO bets have been placed yet
+     * @dev This prevents owner from canceling games mid-betting to grief users
+     */
     function emergencyCancelGame(uint256 _gameId) external onlyOwner {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         
         Game storage game = games[_gameId];
         if (game.phase == GamePhase.Finalized) revert GameAlreadyResolved();
         
+        // Only allow cancel if no bets have been placed
+        uint256 totalBettors = game.redBettors + game.blueBettors;
+        if (totalBettors > 0) revert GameHasBets();
+        
         _cancelGame(_gameId, "Emergency cancellation by owner");
+    }
+    
+    /**
+     * @notice Circuit breaker - pause/unpause new game creation
+     * @dev Active games can still complete, only new games are blocked
+     */
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit ContractPausedEvent(_paused);
     }
     
     // Allow contract to receive TAO

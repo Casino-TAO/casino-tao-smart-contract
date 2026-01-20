@@ -22,7 +22,7 @@ module.exports = {
       url: process.env.BITTENSOR_RPC_URL || "https://lite.chain.opentensor.ai",
       chainId: 964,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
-      gasPrice: 'auto'
+      // gasPrice: 'auto'
     },
     // Bittensor Testnet
     bittensorTestnet: {
@@ -30,17 +30,25 @@ module.exports = {
       chainId: 945,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
       gasPrice: 'auto'
+    },
+    taostats: {
+      url: "https://evm.taostats.io/api/eth-rpc",
     }
   },
   etherscan: {
     apiKey: {
-      mainnet: process.env.ETHERSCAN_API_KEY || "",
-      sepolia: process.env.ETHERSCAN_API_KEY || "",
-      base: process.env.BASESCAN_API_KEY || "",
-      baseSepolia: process.env.BASESCAN_API_KEY || "",
-      arbitrumOne: process.env.ARBISCAN_API_KEY || "",
-      polygon: process.env.POLYGONSCAN_API_KEY || ""
-    }
+      taostats: "casinotao",
+    },
+    customChains: [
+      {
+        network: "taostats",
+        chainId: 964,
+        urls: {
+          apiURL: "https://evm.taostats.io/api/api",
+          browserURL: "https://evm.taostats.io"
+        }
+      }
+    ]
   },
   mocha: {
     timeout: 300000
