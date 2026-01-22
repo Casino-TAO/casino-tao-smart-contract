@@ -116,13 +116,15 @@ async function main() {
 
   // Verify initial state
   console.log("Verifying contract state...");
-  const fee = await taoCasino.platformFee();
-  const minPool = await taoCasino.minPoolSize();
+  const fee = await taoCasino.PLATFORM_FEE();
+  const minPool = await taoCasino.MIN_POOL_SIZE();
+  const bettingBlocks = await taoCasino.BETTING_BLOCKS();
   const owner = await taoCasino.owner();
   
   console.log("Owner:", owner);
   console.log("Platform Fee:", fee.toString(), "bps (", Number(fee) / 100, "%)");
-  console.log("Min Pool Size:", hre.ethers.formatEther(minPool), "TAO\n");
+  console.log("Min Pool Size:", hre.ethers.formatEther(minPool), "TAO");
+  console.log("Betting Duration:", bettingBlocks.toString(), "blocks (~", Number(bettingBlocks) * 12 / 60, "minutes)\n");
   
   console.log("📋 Add this to your .env.local:");
   console.log(`NEXT_PUBLIC_CONTRACT_ADDRESS=${address}\n`);
