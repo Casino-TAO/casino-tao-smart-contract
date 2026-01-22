@@ -7,28 +7,18 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 /**
  * @title TAOCasino
  * @notice P2P Underdog betting game on Bittensor EVM - the minority side wins!
- * @dev Features:
- *   - Underdog game mode (less money wins - bet against the crowd!)
- *   - Dual-position betting (bet on BOTH Red AND Blue simultaneously)
- *   - Referral system (referrers earn 10% of referee's platform fees)
- *   - Rapid mode (10-minute games) alongside regular games
- *   - Underdog bonus (reduced fee when betting on smaller side)
+ * @dev Simplified trustless design:
+ *   - All parameters are IMMUTABLE constants
+ *   - Owner can ONLY: withdraw earned fees, pause new games
+ *   - No admin function can affect active games or user funds
+ *   - Dual-position betting (bet on BOTH Red AND Blue)
  *   - Leaderboard tracking for top winners
  *   - Native TAO betting
- *   - Solvency protection (fees locked until game resolves)
+ *   - All games are 100 blocks (~20 minutes)
  */
 contract TAOCasino is ReentrancyGuard, Ownable {
 
     // ==================== ENUMS ====================
-    
-    enum GameType {
-        Underdog    // Less money wins (minority) - the only game type
-    }
-    
-    enum GameSpeed {
-        Regular,    // 105 minutes betting
-        Rapid       // 10 minutes betting
-    }
     
     enum Side {
         Red,
@@ -47,29 +37,32 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     
     struct Game {
         uint256 id;
-        GameType gameType;
-        GameSpeed gameSpeed;
         GamePhase phase;
         uint256 redPool;
         uint256 bluePool;
         uint256 redBettors;
         uint256 blueBettors;
-        uint256 startTime;
-        uint256 endTime;
-        uint256 resolvedTime;
+        uint256 startBlock;
+        uint256 endBlock;
+        uint256 resolvedBlock;
         Side winningSide;
         uint256 totalLiquidity;
         bool hasWinner;
+        // Anti-sniping: random end block within final call window
+        uint256 randomnessBlock;    // Block whose hash determines actualEndBlock
+        uint256 actualEndBlock;     // Randomly selected end (only valid bets before this count)
+        uint256 validRedPool;       // Pool from valid bets only
+        uint256 validBluePool;      // Pool from valid bets only
+        uint256 validLiquidity;     // Liquidity from valid bets only
     }
     
-    // Bet on a specific side (user can have one per side)
     struct SideBet {
         uint256 amount;
+        uint256 placedAtBlock;  // Track when bet was placed for anti-sniping
         bool claimed;
-        address referrer;
+        bool isLateBet;         // True if placed after actualEndBlock (refund only)
     }
     
-    // Combined user bets for a game (both sides)
     struct UserBets {
         SideBet redBet;
         SideBet blueBet;
@@ -80,14 +73,6 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         uint256 totalWins;
         uint256 totalWinnings;
         uint256 totalLosses;
-        uint256 referralEarnings;
-    }
-    
-    struct ReferralInfo {
-        address referrer;
-        uint256 totalReferred;
-        uint256 totalEarnings;
-        bool isActive;
     }
 
     // ==================== CUSTOM ERRORS ====================
@@ -104,88 +89,53 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     error TransferFailed();
     error NoActiveGame();
     error GameStillActive();
-    error InvalidGameDuration();
-    error NotEnoughParticipation();
-    error InvalidReferralCode();
-    error CannotReferSelf();
     error BetTooSmall();
     error ContractPaused();
-    error GameHasBets();
+    error WaitingForRandomness();
+    error LateBetRefundOnly();
+    error TooManyBettors();
+
+    // ==================== IMMUTABLE CONSTANTS ====================
+    
+    uint256 public constant PLATFORM_FEE = 150;              // 1.5% fee
+    uint256 public constant FEE_DENOMINATOR = 10000;
+    uint256 public constant MIN_BET_AMOUNT = 0.001 ether;    // 0.001 TAO minimum
+    uint256 public constant MIN_TOTAL_BETS = 2;              // 2 bettors minimum
+    uint256 public constant MIN_POOL_SIZE = 0.5 ether;       // 0.5 TAO minimum
+    
+    // Block-based durations (~12s/block on Bittensor EVM)
+    // Using blocks instead of timestamps handles chain halting gracefully
+    uint256 public constant BETTING_BLOCKS = 100;            // ~20 minutes
+    uint256 public constant FINAL_CALL_BLOCKS = 25;          // ~5 minutes (last 25 blocks)
+    uint256 public constant RANDOMNESS_DELAY_BLOCKS = 5;     // Wait 5 blocks for unpredictable hash
+    uint256 public constant MAX_BETTORS_PER_GAME = 500;      // Prevent gas DoS in _calculateValidPools
+    uint256 public constant MAX_LEADERBOARD_SIZE = 100;
 
     // ==================== STATE VARIABLES ====================
     
     uint256 public nextGameId = 1;
-    uint256 public platformFee = 150;           // 1.5% normal fee
-    uint256 public referralShareBps = 1000;     // 10% of fees go to referrer
-    uint256 public underdogBonusBps = 500;      // 5% bonus when betting on underdog
-    uint256 public underdogThreshold = 7000;    // Underdog bonus activates when side < 30%
-    
-    uint256 public constant FEE_DENOMINATOR = 10000;
-    uint256 public constant TOKEN_DECIMALS = 18; // TAO uses 18 decimals
-    
-    // Minimum bet amount to prevent dust attacks
-    uint256 public minBetAmount = 0.001 ether;  // 0.001 TAO minimum bet
-    
-    // Circuit breaker - pauses new games but lets active games complete
-    bool public paused = false;
-    
-    // Accumulated fees in native TAO (only from finalized games)
-    uint256 public accumulatedFees;
-    
-    // Per-game fee tracking for solvency (fees locked until game finalizes)
-    mapping(uint256 => uint256) public gameFees;
-    // Per-game referral rewards tracking for clawback on cancel
-    mapping(uint256 => uint256) public gameReferralRewards;
-    // Per-game per-referrer rewards (only transferred to pendingReferralRewards on game resolution)
-    mapping(uint256 => mapping(address => uint256)) public gamePendingReferralRewards;
-    
-    // Game timing parameters (in seconds)
-    uint256 public regularBettingDuration = 105 minutes;
-    uint256 public rapidBettingDuration = 10 minutes;
-    uint256 public finalCallDuration = 15 minutes;
-    uint256 public rapidFinalCallDuration = 3 minutes;
-    uint256 public breakDuration = 15 minutes;
-    uint256 public rapidBreakDuration = 5 minutes;
-    
-    // Minimum participation
-    uint256 public minTotalBets = 2;
-    uint256 public minPoolSize = 1 ether;        // 1 TAO minimum for regular
-    uint256 public rapidMinPoolSize = 0.5 ether; // 0.5 TAO minimum for rapid
-    
-    // Current active game
     uint256 public currentGameId = 0;
+    uint256 public accumulatedFees;
+    bool public paused = false;
     
     // Mappings
     mapping(uint256 => Game) public games;
-    // gameId => user => side => SideBet
     mapping(uint256 => mapping(address => mapping(Side => SideBet))) public sideBets;
     mapping(uint256 => address[]) public gameBettors;
     mapping(uint256 => uint256) public gameBalance;
-    
-    // Track if user has any bet in game (for bettor list)
+    mapping(uint256 => uint256) public gameFees;
     mapping(uint256 => mapping(address => bool)) public hasAnyBet;
-    
-    // Referral mappings
-    mapping(address => ReferralInfo) public referrals;
-    mapping(bytes32 => address) public referralCodes;
-    mapping(address => bytes32) public userReferralCode;
-    mapping(address => uint256) public pendingReferralRewards;
-    
-    // User stats for leaderboard
     mapping(address => UserStats) public userStats;
     
-    // Leaderboard tracking (top 100 by winnings)
+    // Leaderboard
     address[] public leaderboard;
-    uint256 public constant MAX_LEADERBOARD_SIZE = 100;
 
     // ==================== EVENTS ====================
     
     event GameCreated(
         uint256 indexed gameId,
-        GameType gameType,
-        GameSpeed gameSpeed,
-        uint256 startTime,
-        uint256 endTime
+        uint256 startBlock,
+        uint256 endBlock
     );
     
     event BetPlaced(
@@ -193,14 +143,11 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         address indexed bettor,
         Side side,
         uint256 amount,
-        uint256 newPoolTotal,
-        address referrer
+        uint256 newPoolTotal
     );
     
     event GameResolved(
         uint256 indexed gameId,
-        GameType gameType,
-        GameSpeed gameSpeed,
         Side winningSide,
         uint256 redPool,
         uint256 bluePool,
@@ -216,95 +163,26 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         uint256 winnings
     );
     
-    event ReferralCodeCreated(
-        address indexed user,
-        bytes32 codeHash
-    );
-    
-    event ReferralRewardEarned(
-        address indexed referrer,
-        address indexed referee,
-        uint256 amount
-    );
-    
-    event ReferralRewardsClaimed(
-        address indexed referrer,
-        uint256 amount
-    );
-    
     event GameCancelled(uint256 indexed gameId, string reason);
     event RefundClaimed(uint256 indexed gameId, address indexed bettor, Side side, uint256 amount);
-    event FeesReleased(uint256 indexed gameId, uint256 platformFees, uint256 referralFees);
+    event FeesReleased(uint256 indexed gameId, uint256 platformFees);
     event GameTied(uint256 indexed gameId, uint256 redPool, uint256 bluePool);
     event ContractPausedEvent(bool isPaused);
+    event RandomnessCommitted(uint256 indexed gameId, uint256 randomnessBlock);
+    event ActualEndBlockSet(uint256 indexed gameId, uint256 actualEndBlock, uint256 validRedPool, uint256 validBluePool);
+    event LateBetRefunded(uint256 indexed gameId, address indexed bettor, Side side, uint256 amount);
 
     // ==================== CONSTRUCTOR ====================
     
     constructor() {}
 
-    // ==================== REFERRAL FUNCTIONS ====================
-    
-    function createReferralCode(string calldata _code) external {
-        bytes32 codeHash = keccak256(abi.encodePacked(_code));
-        require(referralCodes[codeHash] == address(0), "Code already taken");
-        require(userReferralCode[msg.sender] == bytes32(0), "Already have a code");
-        
-        referralCodes[codeHash] = msg.sender;
-        userReferralCode[msg.sender] = codeHash;
-        
-        referrals[msg.sender] = ReferralInfo({
-            referrer: address(0),
-            totalReferred: 0,
-            totalEarnings: 0,
-            isActive: true
-        });
-        
-        emit ReferralCodeCreated(msg.sender, codeHash);
-    }
-    
-    function validateReferralCode(string calldata _code) public view returns (address) {
-        bytes32 codeHash = keccak256(abi.encodePacked(_code));
-        return referralCodes[codeHash];
-    }
-    
-    function claimReferralRewards() external nonReentrant {
-        uint256 reward = pendingReferralRewards[msg.sender];
-        require(reward > 0, "No rewards to claim");
-        
-        pendingReferralRewards[msg.sender] = 0;
-        
-        (bool success, ) = payable(msg.sender).call{value: reward}("");
-        if (!success) revert TransferFailed();
-        
-        emit ReferralRewardsClaimed(msg.sender, reward);
-    }
-    
-    /**
-     * @notice Transfer referral rewards from a resolved game to claimable balance
-     * @dev Referral rewards are locked until game resolves for solvency
-     * @param _gameId The game ID to claim referral rewards from
-     */
-    function releaseGameReferralRewards(uint256 _gameId) external {
-        if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
-        
-        Game storage game = games[_gameId];
-        
-        // Only allow release from resolved games (not cancelled)
-        require(game.hasWinner && (game.phase == GamePhase.Resolved || game.phase == GamePhase.Finalized), 
-                "Game not resolved");
-        
-        uint256 reward = gamePendingReferralRewards[_gameId][msg.sender];
-        require(reward > 0, "No rewards for this game");
-        
-        // Transfer from game-specific to global pending
-        gamePendingReferralRewards[_gameId][msg.sender] = 0;
-        pendingReferralRewards[msg.sender] += reward;
-        referrals[msg.sender].totalEarnings += reward;
-    }
-
     // ==================== MAIN FUNCTIONS ====================
     
-    function startNewGame(GameSpeed _gameSpeed) external {
+    /**
+     * @notice Start a new game (anyone can call)
+     * @dev All games are 100 blocks (~20 minutes)
+     */
+    function startNewGame() external {
         if (paused) revert ContractPaused();
         
         if (currentGameId > 0) {
@@ -314,206 +192,263 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         }
         
         uint256 gameId = nextGameId++;
-        uint256 startTime = block.timestamp;
-        uint256 duration = _gameSpeed == GameSpeed.Regular ? regularBettingDuration : rapidBettingDuration;
-        uint256 endTime = startTime + duration;
+        uint256 startBlock = block.number;
+        uint256 endBlock = startBlock + BETTING_BLOCKS;
         
         games[gameId] = Game({
             id: gameId,
-            gameType: GameType.Underdog,
-            gameSpeed: _gameSpeed,
             phase: GamePhase.Betting,
             redPool: 0,
             bluePool: 0,
             redBettors: 0,
             blueBettors: 0,
-            startTime: startTime,
-            endTime: endTime,
-            resolvedTime: 0,
+            startBlock: startBlock,
+            endBlock: endBlock,
+            resolvedBlock: 0,
             winningSide: Side.Red,
             totalLiquidity: 0,
-            hasWinner: false
+            hasWinner: false,
+            randomnessBlock: 0,
+            actualEndBlock: 0,
+            validRedPool: 0,
+            validBluePool: 0,
+            validLiquidity: 0
         });
         
         currentGameId = gameId;
         
-        emit GameCreated(gameId, GameType.Underdog, _gameSpeed, startTime, endTime);
+        emit GameCreated(gameId, startBlock, endBlock);
     }
     
     /**
-     * @notice Place a bet on a specific side (users can bet on BOTH sides)
+     * @notice Place a bet on a side (can bet on BOTH sides)
      * @param _gameId Game to bet on
      * @param _side Red or Blue
-     * @param _referralCode Optional referral code (empty string if none)
      */
-    function placeBet(
-        uint256 _gameId, 
-        Side _side,
-        string calldata _referralCode
-    ) external payable nonReentrant {
+    function placeBet(uint256 _gameId, Side _side) external payable nonReentrant {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         if (msg.value == 0) revert InvalidBetAmount();
-        if (msg.value < minBetAmount) revert BetTooSmall();
+        if (msg.value < MIN_BET_AMOUNT) revert BetTooSmall();
         
         Game storage game = games[_gameId];
         
         if (game.phase != GamePhase.Betting) revert GameNotInBettingPhase();
-        if (block.timestamp >= game.endTime) revert BettingPeriodEnded();
+        if (block.number >= game.endBlock) revert BettingPeriodEnded();
         
         SideBet storage existingBet = sideBets[_gameId][msg.sender][_side];
         
-        uint256 _amount = msg.value;
+        // Calculate flat 1.5% fee
+        uint256 feeAmount = (msg.value * PLATFORM_FEE) / FEE_DENOMINATOR;
+        uint256 netAmount = msg.value - feeAmount;
         
-        // Calculate fee rate (with underdog bonus if applicable)
-        uint256 feeRate = platformFee;
-        
-        if (game.redPool + game.bluePool > 0) {
-            uint256 sidePool = _side == Side.Red ? game.redPool : game.bluePool;
-            uint256 totalPool = game.redPool + game.bluePool;
-            uint256 sidePercentage = (sidePool * FEE_DENOMINATOR) / totalPool;
-            
-            // If betting on the underdog (< 30%), reduce fee
-            if (sidePercentage < (FEE_DENOMINATOR - underdogThreshold)) {
-                feeRate = feeRate > underdogBonusBps ? feeRate - underdogBonusBps : 0;
-            }
-        }
-        
-        uint256 feeAmount = (_amount * feeRate) / FEE_DENOMINATOR;
-        uint256 netAmount = _amount - feeAmount;
-        uint256 referralReward = 0;
-        
-        // Handle referral - rewards are held until game resolves (for solvency)
-        address referrer = existingBet.referrer;
-        if (bytes(_referralCode).length > 0 && referrer == address(0)) {
-            referrer = validateReferralCode(_referralCode);
-            if (referrer != address(0) && referrer != msg.sender) {
-                referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
-                feeAmount -= referralReward;
-                
-                // Store in game-specific pending (not global) until game resolves
-                gamePendingReferralRewards[_gameId][referrer] += referralReward;
-                gameReferralRewards[_gameId] += referralReward;
-                referrals[referrer].totalReferred++;
-                
-                emit ReferralRewardEarned(referrer, msg.sender, referralReward);
-            }
-        } else if (referrer != address(0)) {
-            // Existing referrer on this bet
-            referralReward = (feeAmount * referralShareBps) / FEE_DENOMINATOR;
-            feeAmount -= referralReward;
-            
-            // Store in game-specific pending (not global) until game resolves
-            gamePendingReferralRewards[_gameId][referrer] += referralReward;
-            gameReferralRewards[_gameId] += referralReward;
-            
-            emit ReferralRewardEarned(referrer, msg.sender, referralReward);
-        }
-        
-        // Track fees per game (NOT in accumulatedFees until game finalizes)
+        // Track fees per game (released only on resolution)
         gameFees[_gameId] += feeAmount;
         gameBalance[_gameId] += netAmount;
         
-        // Check if this is a new bettor on this side
+        // Check if new bettor on this side
         bool isNewBettorOnSide = existingBet.amount == 0;
         
-        // Update user's side bet
-        existingBet.amount += _amount;
+        // Update bet
+        existingBet.amount += msg.value;
+        existingBet.placedAtBlock = block.number;  // Track when bet was placed
         existingBet.claimed = false;
-        if (referrer != address(0)) {
-            existingBet.referrer = referrer;
-        }
+        existingBet.isLateBet = false;  // Will be determined at resolution
         
-        // Update game pools
+        // Update pools
         if (_side == Side.Red) {
-            game.redPool += _amount;
-            if (isNewBettorOnSide) {
-                game.redBettors++;
-            }
+            game.redPool += msg.value;
+            if (isNewBettorOnSide) game.redBettors++;
         } else {
-            game.bluePool += _amount;
-            if (isNewBettorOnSide) {
-                game.blueBettors++;
-            }
+            game.bluePool += msg.value;
+            if (isNewBettorOnSide) game.blueBettors++;
         }
         
         game.totalLiquidity += netAmount;
         
-        // Track bettor (only add to list once)
+        // Track bettor (only add once)
         if (!hasAnyBet[_gameId][msg.sender]) {
+            // Prevent gas DoS - limit bettors per game
+            if (gameBettors[_gameId].length >= MAX_BETTORS_PER_GAME) revert TooManyBettors();
+            
             hasAnyBet[_gameId][msg.sender] = true;
             gameBettors[_gameId].push(msg.sender);
         }
         
-        // Update user stats
         userStats[msg.sender].totalBets++;
         
         uint256 newPoolTotal = _side == Side.Red ? game.redPool : game.bluePool;
-        emit BetPlaced(_gameId, msg.sender, _side, _amount, newPoolTotal, referrer);
+        emit BetPlaced(_gameId, msg.sender, _side, msg.value, newPoolTotal);
     }
     
+    /**
+     * @notice Resolve a game after betting ends (two-phase for anti-sniping)
+     * @dev Phase 1: Commit to future block for randomness
+     *      Phase 2: Use blockhash to determine actual end, filter late bets
+     * @param _gameId Game to resolve
+     */
     function resolveGame(uint256 _gameId) external {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         
         Game storage game = games[_gameId];
         
-        if (game.phase != GamePhase.Betting) revert GameAlreadyResolved();
-        if (block.timestamp < game.endTime) revert BettingPeriodNotEnded();
-        
-        uint256 totalBettors = game.redBettors + game.blueBettors;
-        uint256 totalPool = game.redPool + game.bluePool;
-        uint256 minPool = game.gameSpeed == GameSpeed.Rapid ? rapidMinPoolSize : minPoolSize;
-        
-        if (totalBettors < minTotalBets || totalPool < minPool) {
-            _cancelGame(_gameId, "Insufficient participation");
+        // PHASE 1: Commit to randomness block
+        if (game.phase == GamePhase.Betting) {
+            if (block.number < game.endBlock) revert BettingPeriodNotEnded();
+            
+            // Commit to a future block for unpredictable randomness
+            game.randomnessBlock = block.number + RANDOMNESS_DELAY_BLOCKS;
+            game.phase = GamePhase.Calculating;
+            
+            emit RandomnessCommitted(_gameId, game.randomnessBlock);
             return;
         }
         
-        // Check for exact tie - refund everyone
-        if (game.redPool == game.bluePool) {
-            emit GameTied(_gameId, game.redPool, game.bluePool);
-            _cancelGame(_gameId, "Exact tie - refunding all bets");
+        // PHASE 2: Finalize with random end block
+        if (game.phase == GamePhase.Calculating) {
+            if (block.number <= game.randomnessBlock) revert WaitingForRandomness();
+            
+            // Combined blockhash: use multiple block hashes for stronger randomness
+            // This makes validator manipulation much harder (would need to control 3 consecutive blocks)
+            bytes32 hash1 = blockhash(game.randomnessBlock);
+            bytes32 hash2 = blockhash(game.randomnessBlock > 0 ? game.randomnessBlock - 1 : 0);
+            bytes32 hash3 = blockhash(game.randomnessBlock > 1 ? game.randomnessBlock - 2 : 0);
+            
+            // Combine hashes for entropy
+            bytes32 entropy = keccak256(abi.encodePacked(hash1, hash2, hash3));
+            
+            uint256 finalCallStart = game.endBlock - FINAL_CALL_BLOCKS;
+            
+            // If primary hash is 0 (too old, >256 blocks), use endBlock as fallback
+            // Game must still complete even without randomness benefit
+            if (hash1 == bytes32(0)) {
+                game.actualEndBlock = game.endBlock;
+            } else {
+                // Random offset within final call window
+                uint256 randomOffset = uint256(entropy) % FINAL_CALL_BLOCKS;
+                game.actualEndBlock = finalCallStart + randomOffset;
+            }
+            
+            // Calculate valid pools (excluding late bets)
+            _calculateValidPools(_gameId);
+            
+            emit ActualEndBlockSet(_gameId, game.actualEndBlock, game.validRedPool, game.validBluePool);
+            
+            // Check minimum participation with VALID pools
+            uint256 totalValidPool = game.validRedPool + game.validBluePool;
+            
+            if (totalValidPool < MIN_POOL_SIZE || game.validRedPool == 0 || game.validBluePool == 0) {
+                _cancelGame(_gameId, "Insufficient valid participation after anti-snipe filter");
+                return;
+            }
+            
+            // Check for exact tie in valid pools
+            if (game.validRedPool == game.validBluePool) {
+                emit GameTied(_gameId, game.validRedPool, game.validBluePool);
+                _cancelGame(_gameId, "Exact tie - refunding all bets");
+                return;
+            }
+            
+            // Underdog wins (minority side based on VALID pools)
+            Side winner = game.validRedPool < game.validBluePool ? Side.Red : Side.Blue;
+            
+            game.winningSide = winner;
+            game.hasWinner = true;
+            game.phase = GamePhase.Resolved;
+            game.resolvedBlock = block.number;
+            
+            // Release fees (only from valid bets) to accumulatedFees
+            // Late bets get full refund including fees
+            uint256 releasedFees = gameFees[_gameId];
+            accumulatedFees += releasedFees;
+            gameFees[_gameId] = 0;
+            
+            emit FeesReleased(_gameId, releasedFees);
+            
+            emit GameResolved(
+                _gameId,
+                winner,
+                game.validRedPool,
+                game.validBluePool,
+                game.redBettors,
+                game.blueBettors
+            );
             return;
         }
         
-        // Underdog: Less money wins (minority side wins)
-        Side winner = game.redPool < game.bluePool ? Side.Red : Side.Blue;
-        
-        game.winningSide = winner;
-        game.hasWinner = true;
-        game.phase = GamePhase.Resolved;
-        game.resolvedTime = block.timestamp;
-        
-        // Release fees to accumulatedFees now that game is resolved (safe to withdraw)
-        uint256 releasedFees = gameFees[_gameId];
-        uint256 releasedReferralRewards = gameReferralRewards[_gameId];
-        accumulatedFees += releasedFees;
-        
-        emit FeesReleased(_gameId, releasedFees, releasedReferralRewards);
-        
-        emit GameResolved(
-            _gameId,
-            game.gameType,
-            game.gameSpeed,
-            winner,
-            game.redPool,
-            game.bluePool,
-            game.redBettors,
-            game.blueBettors
-        );
+        revert GameAlreadyResolved();
     }
     
     /**
-     * @notice Claim winnings from a resolved game (only winning side bet pays out)
-     * @param _gameId Game ID to claim from
-     * @param _side Side to claim from (must be winning side)
+     * @notice Calculate valid pools by filtering out late bets
+     * @dev Iterates through all bettors to sum valid bets and mark late bets
+     */
+    function _calculateValidPools(uint256 _gameId) internal {
+        Game storage game = games[_gameId];
+        address[] storage bettors = gameBettors[_gameId];
+        
+        uint256 validRedPool = 0;
+        uint256 validBluePool = 0;
+        uint256 validLiquidity = 0;
+        uint256 lateFees = 0;
+        
+        for (uint256 i = 0; i < bettors.length; i++) {
+            address bettor = bettors[i];
+            
+            // Check Red bet
+            SideBet storage redBet = sideBets[_gameId][bettor][Side.Red];
+            if (redBet.amount > 0) {
+                if (redBet.placedAtBlock < game.actualEndBlock) {
+                    // Valid bet - count towards pool
+                    validRedPool += redBet.amount;
+                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+                    validLiquidity += redBet.amount - fee;
+                } else {
+                    // Late bet - mark for refund
+                    redBet.isLateBet = true;
+                    uint256 fee = (redBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+                    lateFees += fee;
+                }
+            }
+            
+            // Check Blue bet
+            SideBet storage blueBet = sideBets[_gameId][bettor][Side.Blue];
+            if (blueBet.amount > 0) {
+                if (blueBet.placedAtBlock < game.actualEndBlock) {
+                    // Valid bet - count towards pool
+                    validBluePool += blueBet.amount;
+                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+                    validLiquidity += blueBet.amount - fee;
+                } else {
+                    // Late bet - mark for refund
+                    blueBet.isLateBet = true;
+                    uint256 fee = (blueBet.amount * PLATFORM_FEE) / FEE_DENOMINATOR;
+                    lateFees += fee;
+                }
+            }
+        }
+        
+        game.validRedPool = validRedPool;
+        game.validBluePool = validBluePool;
+        game.validLiquidity = validLiquidity;
+        
+        // Return late fees to gameBalance for refunds
+        if (lateFees > 0) {
+            gameFees[_gameId] -= lateFees;
+            gameBalance[_gameId] += lateFees;
+        }
+    }
+    
+    /**
+     * @notice Claim winnings from a resolved game
+     * @param _gameId Game ID
+     * @param _side Side to claim from
      */
     function claimWinnings(uint256 _gameId, Side _side) external nonReentrant {
         _claimWinnings(_gameId, _side);
     }
     
     /**
-     * @notice Convenience function to claim both sides at once
-     * @dev Now uses internal function calls to prevent reentrancy
+     * @notice Claim both sides at once
      */
     function claimAllWinnings(uint256 _gameId) external nonReentrant {
         SideBet storage redBet = sideBets[_gameId][msg.sender][Side.Red];
@@ -527,9 +462,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         }
     }
     
-    /**
-     * @notice Internal function to claim winnings (shared by claimWinnings and claimAllWinnings)
-     */
+    // ==================== INTERNAL FUNCTIONS ====================
+    
     function _claimWinnings(uint256 _gameId, Side _side) internal {
         if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
         
@@ -541,10 +475,12 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         uint256 payout = 0;
         
-        // Handle cancelled games - refund both sides
+        // Handle cancelled games - full refund (all bets)
         if (!game.hasWinner && game.phase == GamePhase.Finalized) {
             payout = bet.amount;
             bet.claimed = true;
+            
+            gameBalance[_gameId] -= payout;
             
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
@@ -557,53 +493,56 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             revert GameNotResolved();
         }
         
-        // If this side lost, mark as claimed but no payout
+        // Handle LATE BETS - full refund (anti-sniping protection)
+        if (bet.isLateBet) {
+            payout = bet.amount;  // Full refund including fee portion
+            bet.claimed = true;
+            
+            gameBalance[_gameId] -= payout;
+            
+            (bool success, ) = payable(msg.sender).call{value: payout}("");
+            if (!success) revert TransferFailed();
+            
+            emit LateBetRefunded(_gameId, msg.sender, _side, payout);
+            return;
+        }
+        
+        // Valid bet on losing side gets nothing
         if (_side != game.winningSide) {
             bet.claimed = true;
             userStats[msg.sender].totalLosses++;
             return;
         }
         
-        // Calculate winnings for winning side
-        uint256 winningPool = game.winningSide == Side.Red ? game.redPool : game.bluePool;
+        // Calculate winnings using VALID pools only
+        uint256 winningPool = game.winningSide == Side.Red ? game.validRedPool : game.validBluePool;
         uint256 userShare = (bet.amount * 1e18) / winningPool;
-        
-        payout = (gameBalance[_gameId] * userShare) / 1e18;
+        payout = (game.validLiquidity * userShare) / 1e18;
         
         bet.claimed = true;
         
         if (payout > 0) {
+            gameBalance[_gameId] -= payout;
+            
             (bool success, ) = payable(msg.sender).call{value: payout}("");
             if (!success) revert TransferFailed();
         }
         
-        // Update stats
         userStats[msg.sender].totalWins++;
         userStats[msg.sender].totalWinnings += payout;
         
-        // Update leaderboard
         _updateLeaderboard(msg.sender);
         
         emit WinningsClaimed(_gameId, msg.sender, _side, bet.amount, payout);
     }
     
-    // ==================== INTERNAL FUNCTIONS ====================
-    
     function _cancelGame(uint256 _gameId, string memory _reason) internal {
         Game storage game = games[_gameId];
         
-        // Return ALL fees (platform + referral) to game balance for full refunds
-        // This ensures solvency - all original bet amounts can be refunded
-        uint256 platformFeesToReturn = gameFees[_gameId];
-        uint256 referralFeesToReturn = gameReferralRewards[_gameId];
-        
-        gameBalance[_gameId] += platformFeesToReturn + referralFeesToReturn;
-        
-        // Clear the per-game fee tracking (funds returned to players)
+        // Return fees to game balance for full refunds
+        uint256 feesToReturn = gameFees[_gameId];
+        gameBalance[_gameId] += feesToReturn;
         gameFees[_gameId] = 0;
-        gameReferralRewards[_gameId] = 0;
-        // Note: gamePendingReferralRewards[_gameId][referrer] is NOT transferred to global
-        // This means referrers don't earn from cancelled games
         
         uint256 totalPool = game.redPool + game.bluePool;
         game.totalLiquidity = totalPool;
@@ -662,16 +601,10 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return games[currentGameId];
     }
     
-    /**
-     * @notice Get user's bet on a specific side
-     */
     function getUserSideBet(uint256 _gameId, address _user, Side _side) external view returns (SideBet memory) {
         return sideBets[_gameId][_user][_side];
     }
     
-    /**
-     * @notice Get user's bets on both sides
-     */
     function getUserBets(uint256 _gameId, address _user) external view returns (UserBets memory) {
         return UserBets({
             redBet: sideBets[_gameId][_user][Side.Red],
@@ -681,14 +614,6 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     
     function getUserStats(address _user) external view returns (UserStats memory) {
         return userStats[_user];
-    }
-    
-    function getReferralInfo(address _user) external view returns (ReferralInfo memory) {
-        return referrals[_user];
-    }
-    
-    function getPendingReferralRewards(address _user) external view returns (uint256) {
-        return pendingReferralRewards[_user];
     }
     
     function getLeaderboard() external view returns (address[] memory) {
@@ -722,20 +647,16 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         Game storage game = games[_gameId];
         
-        // Get user's existing bet on this side
         uint256 existingBet = sideBets[_gameId][_user][_side].amount;
         uint256 totalUserBet = existingBet + _amount;
         
-        // Calculate fee for new amount only (existing bet already had fee deducted)
-        uint256 feeAmount = (_amount * platformFee) / FEE_DENOMINATOR;
+        uint256 feeAmount = (_amount * PLATFORM_FEE) / FEE_DENOMINATOR;
         uint256 netNewAmount = _amount - feeAmount;
         
-        // New pools after this bet
         uint256 sidePool = _side == Side.Red ? game.redPool : game.bluePool;
         uint256 newSidePool = sidePool + _amount;
         uint256 newTotalLiquidity = game.totalLiquidity + netNewAmount;
         
-        // Calculate payout based on user's TOTAL position
         return (totalUserBet * newTotalLiquidity) / newSidePool;
     }
     
@@ -750,15 +671,15 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return (game.totalLiquidity * 10000) / sidePool;
     }
     
-    function getTimeRemaining(uint256 _gameId) external view returns (uint256) {
+    function getBlocksRemaining(uint256 _gameId) external view returns (uint256) {
         if (_gameId == 0 || _gameId >= nextGameId) return 0;
         
         Game storage game = games[_gameId];
         
         if (game.phase != GamePhase.Betting) return 0;
-        if (block.timestamp >= game.endTime) return 0;
+        if (block.number >= game.endBlock) return 0;
         
-        return game.endTime - block.timestamp;
+        return game.endBlock - block.number;
     }
     
     function isInFinalCall(uint256 _gameId) external view returns (bool) {
@@ -768,9 +689,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         if (game.phase != GamePhase.Betting) return false;
         
-        uint256 finalCall = game.gameSpeed == GameSpeed.Rapid ? rapidFinalCallDuration : finalCallDuration;
-        uint256 finalCallStart = game.endTime - finalCall;
-        return block.timestamp >= finalCallStart && block.timestamp < game.endTime;
+        uint256 finalCallStartBlock = game.endBlock - FINAL_CALL_BLOCKS;
+        return block.number >= finalCallStartBlock && block.number < game.endBlock;
     }
     
     function getGameCount() external view returns (uint256) {
@@ -785,70 +705,43 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         return gameBalance[_gameId];
     }
     
-    function getGameFees(uint256 _gameId) external view returns (uint256 platformFees, uint256 referralFees) {
-        return (gameFees[_gameId], gameReferralRewards[_gameId]);
+    function getGameFees(uint256 _gameId) external view returns (uint256) {
+        return gameFees[_gameId];
     }
     
-    function getGamePendingReferralReward(uint256 _gameId, address _referrer) external view returns (uint256) {
-        return gamePendingReferralRewards[_gameId][_referrer];
-    }
-    
-    function isUnderdogSide(uint256 _gameId, Side _side) external view returns (bool) {
+    /**
+     * @notice Get anti-sniping resolution status
+     * @return phase Current game phase
+     * @return randomnessBlock Block whose hash will determine actual end
+     * @return actualEndBlock The randomly selected end block (0 if not yet determined)
+     * @return canFinalize True if phase 2 can be called
+     */
+    function getResolutionStatus(uint256 _gameId) external view returns (
+        GamePhase phase,
+        uint256 randomnessBlock,
+        uint256 actualEndBlock,
+        bool canFinalize
+    ) {
         Game storage game = games[_gameId];
-        uint256 totalPool = game.redPool + game.bluePool;
-        if (totalPool == 0) return false;
-        
-        uint256 sidePool = _side == Side.Red ? game.redPool : game.bluePool;
-        uint256 sidePercentage = (sidePool * FEE_DENOMINATOR) / totalPool;
-        
-        return sidePercentage < (FEE_DENOMINATOR - underdogThreshold);
+        phase = game.phase;
+        randomnessBlock = game.randomnessBlock;
+        actualEndBlock = game.actualEndBlock;
+        canFinalize = (game.phase == GamePhase.Calculating && block.number > game.randomnessBlock);
+    }
+    
+    /**
+     * @notice Check if a specific bet was marked as late (for anti-sniping)
+     */
+    function isBetLate(uint256 _gameId, address _user, Side _side) external view returns (bool) {
+        return sideBets[_gameId][_user][_side].isLateBet;
     }
 
     // ==================== ADMIN FUNCTIONS ====================
     
-    function setPlatformFee(uint256 _fee) external onlyOwner {
-        require(_fee <= 1000, "Fee cannot exceed 10%");
-        platformFee = _fee;
-    }
-    
-    function setReferralShareBps(uint256 _share) external onlyOwner {
-        require(_share <= 5000, "Referral share cannot exceed 50%");
-        referralShareBps = _share;
-    }
-    
-    function setUnderdogBonus(uint256 _bonus, uint256 _threshold) external onlyOwner {
-        require(_bonus <= 1000, "Bonus cannot exceed 10%");
-        require(_threshold <= 9000, "Threshold too high");
-        underdogBonusBps = _bonus;
-        underdogThreshold = _threshold;
-    }
-    
-    function setRegularBettingDuration(uint256 _duration) external onlyOwner {
-        if (_duration < 30 minutes || _duration > 24 hours) revert InvalidGameDuration();
-        regularBettingDuration = _duration;
-    }
-    
-    function setRapidBettingDuration(uint256 _duration) external onlyOwner {
-        if (_duration < 5 minutes || _duration > 1 hours) revert InvalidGameDuration();
-        rapidBettingDuration = _duration;
-    }
-    
-    function setMinParticipation(uint256 _minBets, uint256 _minPool, uint256 _rapidMinPool) external onlyOwner {
-        // Reasonable bounds to prevent owner from making games impossible
-        require(_minBets <= 100, "Min bets cannot exceed 100");
-        require(_minPool <= 100 ether, "Min pool cannot exceed 100 TAO");
-        require(_rapidMinPool <= 50 ether, "Rapid min pool cannot exceed 50 TAO");
-        
-        minTotalBets = _minBets;
-        minPoolSize = _minPool;
-        rapidMinPoolSize = _rapidMinPool;
-    }
-    
-    function setMinBetAmount(uint256 _minBet) external onlyOwner {
-        require(_minBet <= 1 ether, "Min bet cannot exceed 1 TAO");
-        minBetAmount = _minBet;
-    }
-    
+    /**
+     * @notice Withdraw accumulated platform fees (only from resolved games)
+     * @dev Safe: only touches accumulatedFees, never user principal
+     */
     function withdrawFees() external onlyOwner {
         if (accumulatedFees > 0) {
             uint256 fees = accumulatedFees;
@@ -864,23 +757,6 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Emergency cancel a game - only allowed if NO bets have been placed yet
-     * @dev This prevents owner from canceling games mid-betting to grief users
-     */
-    function emergencyCancelGame(uint256 _gameId) external onlyOwner {
-        if (_gameId == 0 || _gameId >= nextGameId) revert GameNotFound();
-        
-        Game storage game = games[_gameId];
-        if (game.phase == GamePhase.Finalized) revert GameAlreadyResolved();
-        
-        // Only allow cancel if no bets have been placed
-        uint256 totalBettors = game.redBettors + game.blueBettors;
-        if (totalBettors > 0) revert GameHasBets();
-        
-        _cancelGame(_gameId, "Emergency cancellation by owner");
-    }
-    
-    /**
      * @notice Circuit breaker - pause/unpause new game creation
      * @dev Active games can still complete, only new games are blocked
      */
@@ -888,7 +764,4 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         paused = _paused;
         emit ContractPausedEvent(_paused);
     }
-    
-    // Allow contract to receive TAO
-    receive() external payable {}
 }
