@@ -48,8 +48,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         Side winningSide;
         uint256 totalLiquidity;
         bool hasWinner;
-        // Anti-sniping: random end block within final call window
-        uint256 randomnessBlock;    // Block whose hash determines actualEndBlock
+        // Anti-sniping: random end block within final call window (drand-based)
+        uint64 targetDrandRound;    // Drand round committed to for randomness
+        uint256 commitBlock;        // Block when we committed to drand round (for timeout)
         uint256 actualEndBlock;     // Randomly selected end (only valid bets before this count)
         uint256 validRedPool;       // Pool from valid bets only
         uint256 validBluePool;      // Pool from valid bets only
@@ -94,6 +95,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     error WaitingForRandomness();
     error LateBetRefundOnly();
     error TooManyBettors();
+    error DrandPulseNotAvailable();
+    error DrandPrecompileCallFailed();
 
     // ==================== IMMUTABLE CONSTANTS ====================
     
@@ -107,9 +110,23 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     // Using blocks instead of timestamps handles chain halting gracefully
     uint256 public constant BETTING_BLOCKS = 100;            // ~20 minutes
     uint256 public constant FINAL_CALL_BLOCKS = 25;          // ~5 minutes (last 25 blocks)
-    uint256 public constant RANDOMNESS_DELAY_BLOCKS = 5;     // Wait 5 blocks for unpredictable hash
     uint256 public constant MAX_BETTORS_PER_GAME = 500;      // Prevent gas DoS in _calculateValidPools
     uint256 public constant MAX_LEADERBOARD_SIZE = 100;
+    
+    // ==================== DRAND RANDOMNESS CONSTANTS ====================
+    
+    // Substrate storage precompile for reading runtime storage
+    address public constant STORAGE_PRECOMPILE = 0x0000000000000000000000000000000000000807;
+    
+    // Drand pallet storage key prefixes (from substrate metadata)
+    // drand.pulses prefix (StorageMap with Blake2_128Concat hasher)
+    bytes public constant DRAND_PULSES_PREFIX = hex"a285cdb66e8b8524ea70b1693c7b1e050d8e70fd32bfb1639703f9a23d15b15e";
+    // drand.lastStoredRound key (StorageValue)
+    bytes32 public constant DRAND_LAST_ROUND_KEY = 0xa285cdb66e8b8524ea70b1693c7b1e05087f3dd6e0ceded0e388dd34f810a73d;
+    
+    // Drand configuration
+    uint256 public constant DRAND_ROUND_BUFFER = 3;          // Commit to lastStoredRound + 3 for unpredictability
+    uint256 public constant DRAND_TIMEOUT_BLOCKS = 7200;     // ~24 hours timeout if pulse unavailable
 
     // ==================== STATE VARIABLES ====================
     
@@ -168,9 +185,10 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     event FeesReleased(uint256 indexed gameId, uint256 platformFees);
     event GameTied(uint256 indexed gameId, uint256 redPool, uint256 bluePool);
     event ContractPausedEvent(bool isPaused);
-    event RandomnessCommitted(uint256 indexed gameId, uint256 randomnessBlock);
+    event DrandRoundCommitted(uint256 indexed gameId, uint64 targetDrandRound, uint256 commitBlock);
     event ActualEndBlockSet(uint256 indexed gameId, uint256 actualEndBlock, uint256 validRedPool, uint256 validBluePool);
     event LateBetRefunded(uint256 indexed gameId, address indexed bettor, Side side, uint256 amount);
+    event DrandTimeoutCancelled(uint256 indexed gameId, uint64 targetDrandRound, uint256 blocksWaited);
 
     // ==================== CONSTRUCTOR ====================
     
@@ -208,7 +226,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             winningSide: Side.Red,
             totalLiquidity: 0,
             hasWinner: false,
-            randomnessBlock: 0,
+            targetDrandRound: 0,
+            commitBlock: 0,
             actualEndBlock: 0,
             validRedPool: 0,
             validBluePool: 0,
@@ -282,8 +301,9 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     
     /**
      * @notice Resolve a game after betting ends (two-phase for anti-sniping)
-     * @dev Phase 1: Commit to future block for randomness
-     *      Phase 2: Use blockhash to determine actual end, filter late bets
+     * @dev Phase 1: Commit to future drand round for randomness
+     *      Phase 2: Use drand pulse to determine actual end, filter late bets
+     *      Timeout: Cancel if drand pulse not available after DRAND_TIMEOUT_BLOCKS
      * @param _gameId Game to resolve
      */
     function resolveGame(uint256 _gameId) external {
@@ -291,42 +311,50 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         Game storage game = games[_gameId];
         
-        // PHASE 1: Commit to randomness block
+        // PHASE 1: Commit to drand round
         if (game.phase == GamePhase.Betting) {
             if (block.number < game.endBlock) revert BettingPeriodNotEnded();
             
-            // Commit to a future block for unpredictable randomness
-            game.randomnessBlock = block.number + RANDOMNESS_DELAY_BLOCKS;
+            // Get current last stored drand round and commit to a future round
+            uint64 lastRound = _getLastStoredRound();
+            if (lastRound == 0) {
+                // Drand not available at all - use fallback or revert
+                // For safety, we'll cancel the game
+                _cancelGame(_gameId, "Drand not available");
+                return;
+            }
+            
+            // Commit to lastStoredRound + buffer for unpredictable randomness
+            game.targetDrandRound = lastRound + uint64(DRAND_ROUND_BUFFER);
+            game.commitBlock = block.number;
             game.phase = GamePhase.Calculating;
             
-            emit RandomnessCommitted(_gameId, game.randomnessBlock);
+            emit DrandRoundCommitted(_gameId, game.targetDrandRound, game.commitBlock);
             return;
         }
         
-        // PHASE 2: Finalize with random end block
+        // PHASE 2: Finalize with drand randomness
         if (game.phase == GamePhase.Calculating) {
-            if (block.number <= game.randomnessBlock) revert WaitingForRandomness();
+            // Check for timeout first
+            if (block.number > game.commitBlock + DRAND_TIMEOUT_BLOCKS) {
+                emit DrandTimeoutCancelled(_gameId, game.targetDrandRound, block.number - game.commitBlock);
+                _cancelGame(_gameId, "Drand pulse timeout - randomness not available");
+                return;
+            }
             
-            // Combined blockhash: use multiple block hashes for stronger randomness
-            // This makes validator manipulation much harder (would need to control 3 consecutive blocks)
-            bytes32 hash1 = blockhash(game.randomnessBlock);
-            bytes32 hash2 = blockhash(game.randomnessBlock > 0 ? game.randomnessBlock - 1 : 0);
-            bytes32 hash3 = blockhash(game.randomnessBlock > 1 ? game.randomnessBlock - 2 : 0);
+            // Try to get randomness from committed drand round
+            bytes32 randomness = _getDrandRandomness(game.targetDrandRound);
             
-            // Combine hashes for entropy
-            bytes32 entropy = keccak256(abi.encodePacked(hash1, hash2, hash3));
+            // If randomness not yet available, caller must wait and try again
+            if (randomness == bytes32(0)) {
+                revert WaitingForRandomness();
+            }
             
             uint256 finalCallStart = game.endBlock - FINAL_CALL_BLOCKS;
             
-            // If primary hash is 0 (too old, >256 blocks), use endBlock as fallback
-            // Game must still complete even without randomness benefit
-            if (hash1 == bytes32(0)) {
-                game.actualEndBlock = game.endBlock;
-            } else {
-                // Random offset within final call window
-                uint256 randomOffset = uint256(entropy) % FINAL_CALL_BLOCKS;
-                game.actualEndBlock = finalCallStart + randomOffset;
-            }
+            // Use drand randomness to pick actual end block within final call window
+            uint256 randomOffset = uint256(randomness) % FINAL_CALL_BLOCKS;
+            game.actualEndBlock = finalCallStart + randomOffset;
             
             // Calculate valid pools (excluding late bets)
             _calculateValidPools(_gameId);
@@ -552,6 +580,302 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         emit GameCancelled(_gameId, _reason);
     }
     
+    // ==================== DRAND HELPER FUNCTIONS ====================
+    
+    /**
+     * @notice Blake2f precompile address (EIP-152)
+     */
+    address private constant BLAKE2F_PRECOMPILE = address(0x09);
+    
+    /**
+     * @notice Compute blake2b-128 hash using the blake2f precompile (EIP-152)
+     * @dev Uses assembly to avoid stack depth issues
+     * @param data Input data (up to 128 bytes)
+     * @return hash 16-byte blake2b-128 hash
+     */
+    function _blake2b128(bytes memory data) internal view returns (bytes16) {
+        // Blake2f input: rounds (4) + h (64) + m (128) + t (8) + f (1) = 213 bytes
+        bytes memory input = new bytes(213);
+        uint256 dataLen = data.length;
+        
+        assembly ("memory-safe") {
+            let inp := add(input, 32)
+            
+            // Rounds = 12 (0x0000000c big-endian)
+            mstore8(inp, 0)
+            mstore8(add(inp, 1), 0)
+            mstore8(add(inp, 2), 0)
+            mstore8(add(inp, 3), 0x0c)
+            
+            // h state (64 bytes) - blake2b-128 IV with parameter block XOR
+            // h[0] = IV[0] XOR 0x01010010 (16 byte output)
+            // IV[0] = 0x6a09e667f3bcc908, XOR 0x01010010 = 0x6a09e667f3bcf918
+            // All IVs stored in little-endian format
+            
+            // h[0] = 0x6a09e667f3bcc908 XOR 0x01010010 = 0x6a09e667f3bcf918 (LE)
+            mstore8(add(inp, 4), 0x18)
+            mstore8(add(inp, 5), 0xf9)
+            mstore8(add(inp, 6), 0xbc)
+            mstore8(add(inp, 7), 0xf3)
+            mstore8(add(inp, 8), 0x67)
+            mstore8(add(inp, 9), 0xe6)
+            mstore8(add(inp, 10), 0x09)
+            mstore8(add(inp, 11), 0x6a)
+            
+            // h[1] = 0xbb67ae8584caa73b (LE)
+            mstore8(add(inp, 12), 0x3b)
+            mstore8(add(inp, 13), 0xa7)
+            mstore8(add(inp, 14), 0xca)
+            mstore8(add(inp, 15), 0x84)
+            mstore8(add(inp, 16), 0x85)
+            mstore8(add(inp, 17), 0xae)
+            mstore8(add(inp, 18), 0x67)
+            mstore8(add(inp, 19), 0xbb)
+            
+            // h[2] = 0x3c6ef372fe94f82b (LE)
+            mstore8(add(inp, 20), 0x2b)
+            mstore8(add(inp, 21), 0xf8)
+            mstore8(add(inp, 22), 0x94)
+            mstore8(add(inp, 23), 0xfe)
+            mstore8(add(inp, 24), 0x72)
+            mstore8(add(inp, 25), 0xf3)
+            mstore8(add(inp, 26), 0x6e)
+            mstore8(add(inp, 27), 0x3c)
+            
+            // h[3] = 0xa54ff53a5f1d36f1 (LE)
+            mstore8(add(inp, 28), 0xf1)
+            mstore8(add(inp, 29), 0x36)
+            mstore8(add(inp, 30), 0x1d)
+            mstore8(add(inp, 31), 0x5f)
+            mstore8(add(inp, 32), 0x3a)
+            mstore8(add(inp, 33), 0xf5)
+            mstore8(add(inp, 34), 0x4f)
+            mstore8(add(inp, 35), 0xa5)
+            
+            // h[4] = 0x510e527fade682d1 (LE)
+            mstore8(add(inp, 36), 0xd1)
+            mstore8(add(inp, 37), 0x82)
+            mstore8(add(inp, 38), 0xe6)
+            mstore8(add(inp, 39), 0xad)
+            mstore8(add(inp, 40), 0x7f)
+            mstore8(add(inp, 41), 0x52)
+            mstore8(add(inp, 42), 0x0e)
+            mstore8(add(inp, 43), 0x51)
+            
+            // h[5] = 0x9b05688c2b3e6c1f (LE)
+            mstore8(add(inp, 44), 0x1f)
+            mstore8(add(inp, 45), 0x6c)
+            mstore8(add(inp, 46), 0x3e)
+            mstore8(add(inp, 47), 0x2b)
+            mstore8(add(inp, 48), 0x8c)
+            mstore8(add(inp, 49), 0x68)
+            mstore8(add(inp, 50), 0x05)
+            mstore8(add(inp, 51), 0x9b)
+            
+            // h[6] = 0x1f83d9abfb41bd6b (LE)
+            mstore8(add(inp, 52), 0x6b)
+            mstore8(add(inp, 53), 0xbd)
+            mstore8(add(inp, 54), 0x41)
+            mstore8(add(inp, 55), 0xfb)
+            mstore8(add(inp, 56), 0xab)
+            mstore8(add(inp, 57), 0xd9)
+            mstore8(add(inp, 58), 0x83)
+            mstore8(add(inp, 59), 0x1f)
+            
+            // h[7] = 0x5be0cd19137e2179 (LE)
+            mstore8(add(inp, 60), 0x79)
+            mstore8(add(inp, 61), 0x21)
+            mstore8(add(inp, 62), 0x7e)
+            mstore8(add(inp, 63), 0x13)
+            mstore8(add(inp, 64), 0x19)
+            mstore8(add(inp, 65), 0xcd)
+            mstore8(add(inp, 66), 0xe0)
+            mstore8(add(inp, 67), 0x5b)
+            
+            // m message (128 bytes at offset 68) - copy input data, rest is zero-padded
+            let dataPtr := add(data, 32)
+            let mPtr := add(inp, 68)
+            for { let i := 0 } lt(i, dataLen) { i := add(i, 1) } {
+                if lt(i, 128) {
+                    mstore8(add(mPtr, i), byte(0, mload(add(dataPtr, i))))
+                }
+            }
+            // Bytes 68+dataLen to 195 are already zero
+            
+            // t offset (16 bytes at offset 196) - t[0] = dataLen (LE), t[1] = 0
+            mstore8(add(inp, 196), and(dataLen, 0xff))
+            mstore8(add(inp, 197), and(shr(8, dataLen), 0xff))
+            // Rest of t is already zero
+            
+            // f = 1 (final block) at offset 212
+            mstore8(add(inp, 212), 1)
+        }
+        
+        // Call blake2f precompile
+        (bool success, bytes memory result) = BLAKE2F_PRECOMPILE.staticcall(input);
+        require(success && result.length == 64, "blake2f failed");
+        
+        // Extract first 16 bytes as blake2b-128 output
+        bytes16 hash;
+        assembly ("memory-safe") {
+            hash := mload(add(result, 32))
+        }
+        return hash;
+    }
+    
+    /**
+     * @notice Build storage key for drand.pulses(round) using Blake2_128Concat
+     * @param round The drand round number
+     * @return key The full storage key
+     */
+    function _buildDrandPulseKey(uint64 round) internal view returns (bytes memory) {
+        // Encode round as u64 little-endian
+        bytes memory roundLE = new bytes(8);
+        uint64 r = round;
+        for (uint256 i = 0; i < 8; i++) {
+            roundLE[i] = bytes1(uint8(r));
+            r = r >> 8;
+        }
+        
+        // Blake2_128Concat = blake2_128(encoded_key) ++ encoded_key
+        bytes16 hash = _blake2b128(roundLE);
+        
+        // Full key = prefix (32 bytes) + hash (16 bytes) + round (8 bytes) = 56 bytes
+        bytes memory key = new bytes(56);
+        
+        // Copy prefix
+        bytes memory prefix = DRAND_PULSES_PREFIX;
+        for (uint256 i = 0; i < 32; i++) {
+            key[i] = prefix[i];
+        }
+        
+        // Copy blake2 hash
+        for (uint256 i = 0; i < 16; i++) {
+            key[32 + i] = hash[i];
+        }
+        
+        // Copy round (little-endian)
+        for (uint256 i = 0; i < 8; i++) {
+            key[48 + i] = roundLE[i];
+        }
+        
+        return key;
+    }
+    
+    /**
+     * @notice Read a value from Substrate storage using the precompile
+     * @param key The storage key
+     * @return data The stored value (empty if not found)
+     */
+    function _readSubstrateStorage(bytes memory key) internal view returns (bytes memory) {
+        (bool success, bytes memory result) = STORAGE_PRECOMPILE.staticcall(key);
+        if (!success) {
+            return new bytes(0);
+        }
+        return result;
+    }
+    
+    /**
+     * @notice Get the last stored drand round from storage
+     * @return round The last stored round (0 if not available)
+     */
+    function _getLastStoredRound() internal view returns (uint64) {
+        bytes memory key = new bytes(32);
+        bytes32 k = DRAND_LAST_ROUND_KEY;
+        assembly ("memory-safe") {
+            mstore(add(key, 32), k)
+        }
+        
+        bytes memory data = _readSubstrateStorage(key);
+        if (data.length < 8) {
+            return 0;
+        }
+        
+        // Decode u64 little-endian
+        uint64 round = 0;
+        for (uint256 i = 0; i < 8; i++) {
+            round |= uint64(uint8(data[i])) << uint64(i * 8);
+        }
+        return round;
+    }
+    
+    /**
+     * @notice Read a drand pulse and extract the randomness
+     * @param round The drand round to read
+     * @return randomness The 32-byte randomness (empty if pulse not available)
+     */
+    function _getDrandRandomness(uint64 round) internal view returns (bytes32) {
+        bytes memory key = _buildDrandPulseKey(round);
+        bytes memory data = _readSubstrateStorage(key);
+        
+        if (data.length == 0) {
+            return bytes32(0);
+        }
+        
+        // Decode SCALE-encoded Pulse:
+        // - round: u64 (8 bytes LE)
+        // - randomness: BoundedVec<u8, 32> (compact length + up to 32 bytes)
+        // - signature: BoundedVec<u8, 144> (compact length + up to 144 bytes)
+        
+        // We need at least: 8 (round) + 1 (compact len) + 32 (randomness) = 41 bytes
+        if (data.length < 41) {
+            return bytes32(0);
+        }
+        
+        // Skip round (bytes 0-7)
+        // Read compact length at byte 8
+        uint8 compactLen = uint8(data[8]);
+        
+        // For lengths 0-63, compact encoding is just the length byte
+        // For 32 bytes, compact = 0x80 (32 << 2 = 128 = 0x80) - wait, let me recalculate
+        // SCALE compact: if value < 64, encode as (value << 2) | 0b00
+        // For 32: 32 << 2 = 128 = 0x80... that doesn't fit in "single byte mode"
+        // Actually: for 0-63, mode 0: byte = value << 2
+        // For 32: 32 << 2 = 128, which has high bit set, so it's mode 1 (two bytes)
+        // Wait no - let me check SCALE compact again:
+        // Mode 0 (single byte): bits [7:2] = value, bits [1:0] = 00. Range: 0-63
+        // Mode 1 (two bytes): bits [15:2] = value, bits [1:0] = 01. Range: 64-16383
+        // For 32: fits in mode 0, so byte = 32 << 2 | 0 = 128 = 0x80
+        // Hmm, but 0x80 has the pattern XX where low 2 bits are 00, so:
+        // 0x80 = 0b10000000, low 2 bits = 00, so value = 0x80 >> 2 = 32. Correct!
+        
+        // Decode compact length
+        uint256 randomnessLen;
+        uint256 randomnessStart;
+        
+        if ((compactLen & 0x03) == 0) {
+            // Single byte mode
+            randomnessLen = compactLen >> 2;
+            randomnessStart = 9;
+        } else if ((compactLen & 0x03) == 1) {
+            // Two byte mode
+            if (data.length < 10) return bytes32(0);
+            uint16 val = uint16(compactLen) | (uint16(uint8(data[9])) << 8);
+            randomnessLen = val >> 2;
+            randomnessStart = 10;
+        } else {
+            // Four byte or big integer mode - randomness shouldn't need this
+            return bytes32(0);
+        }
+        
+        // Validate length
+        if (randomnessLen != 32) {
+            return bytes32(0);
+        }
+        
+        if (data.length < randomnessStart + 32) {
+            return bytes32(0);
+        }
+        
+        // Extract 32-byte randomness
+        bytes32 randomness;
+        assembly ("memory-safe") {
+            randomness := mload(add(add(data, 32), randomnessStart))
+        }
+        
+        return randomness;
+    }
+    
     function _updateLeaderboard(address _user) internal {
         uint256 userWinnings = userStats[_user].totalWinnings;
         
@@ -710,23 +1034,37 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @notice Get anti-sniping resolution status
+     * @notice Get anti-sniping resolution status (drand-based)
      * @return phase Current game phase
-     * @return randomnessBlock Block whose hash will determine actual end
+     * @return targetDrandRound Drand round committed to for randomness
      * @return actualEndBlock The randomly selected end block (0 if not yet determined)
-     * @return canFinalize True if phase 2 can be called
+     * @return canFinalize True if phase 2 can be called (drand pulse available)
      */
     function getResolutionStatus(uint256 _gameId) external view returns (
         GamePhase phase,
-        uint256 randomnessBlock,
+        uint64 targetDrandRound,
         uint256 actualEndBlock,
         bool canFinalize
     ) {
         Game storage game = games[_gameId];
         phase = game.phase;
-        randomnessBlock = game.randomnessBlock;
+        targetDrandRound = game.targetDrandRound;
         actualEndBlock = game.actualEndBlock;
-        canFinalize = (game.phase == GamePhase.Calculating && block.number > game.randomnessBlock);
+        canFinalize = false;
+        
+        if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0) {
+            bytes32 randomness = _getDrandRandomness(game.targetDrandRound);
+            canFinalize = (randomness != bytes32(0));
+        }
+    }
+    
+    /**
+     * @notice Check if a game's drand resolution has timed out
+     */
+    function isResolutionTimedOut(uint256 _gameId) external view returns (bool) {
+        Game storage game = games[_gameId];
+        if (game.phase != GamePhase.Calculating) return false;
+        return block.number > game.commitBlock + DRAND_TIMEOUT_BLOCKS;
     }
     
     /**
@@ -734,6 +1072,45 @@ contract TAOCasino is ReentrancyGuard, Ownable {
      */
     function isBetLate(uint256 _gameId, address _user, Side _side) external view returns (bool) {
         return sideBets[_gameId][_user][_side].isLateBet;
+    }
+    
+    // ==================== DRAND VIEW FUNCTIONS ====================
+    
+    /**
+     * @notice Get the last stored drand round from the chain
+     * @return round The last available drand round (0 if drand not available)
+     */
+    function getLastDrandRound() external view returns (uint64) {
+        return _getLastStoredRound();
+    }
+    
+    /**
+     * @notice Check if a specific drand round's pulse is available
+     * @param round The drand round to check
+     * @return available True if the pulse is stored and readable
+     */
+    function isDrandRoundAvailable(uint64 round) external view returns (bool) {
+        bytes32 randomness = _getDrandRandomness(round);
+        return randomness != bytes32(0);
+    }
+    
+    /**
+     * @notice Get randomness from a specific drand round (for debugging)
+     * @param round The drand round
+     * @return randomness The 32-byte randomness (zero if not available)
+     */
+    function getDrandRandomness(uint64 round) external view returns (bytes32) {
+        return _getDrandRandomness(round);
+    }
+    
+    /**
+     * @notice Check drand health - returns info about drand availability
+     * @return lastRound The last stored drand round
+     * @return isAvailable True if drand storage is accessible
+     */
+    function getDrandStatus() external view returns (uint64 lastRound, bool isAvailable) {
+        lastRound = _getLastStoredRound();
+        isAvailable = lastRound > 0;
     }
 
     // ==================== ADMIN FUNCTIONS ====================
