@@ -1,0 +1,88 @@
+@startuml Timing Relationships
+
+title TAO Casino - Timing Relationships
+footer Block times and drand round synchronization
+
+skinparam backgroundColor #FEFEFE
+
+!define BLOCK_TIME 12
+!define DRAND_PERIOD 3
+!define BETTING_BLOCKS 100
+!define FINAL_CALL_BLOCKS 25
+!define DRAND_BUFFER 3
+!define TIMEOUT_BLOCKS 7200
+
+scale 1 as 50 pixels
+
+concise "Drand Rounds" as Drand
+concise "Bittensor Blocks" as Chain
+concise "Game Phase" as Game
+concise "Contract State" as State
+
+@0
+Drand is "R" #LightBlue
+Chain is "0" #LightGreen
+Game is "Created" #Yellow
+State is "Betting"
+
+@1
+Drand is "R+1"
+note bottom of Drand: 3 sec
+
+@2
+Drand is "R+2"
+
+@3
+Drand is "R+3"
+
+@4
+Drand is "R+4"
+Chain is "1"
+note bottom of Chain: 12 sec
+
+@5
+Drand is "R+5"
+
+@6
+Drand is "R+6"
+
+@7
+Drand is "R+7"
+
+@8
+Drand is "R+8"
+Chain is "2"
+
+@12
+Drand is "R+12"
+Chain is "3"
+
+@16
+Drand is "R+16"
+Chain is "4"
+
+@300
+Chain is "75"
+Game is "Final Call" #Orange
+note bottom of Game: Last 25 blocks\nBets here may be\nmarked "late"
+
+@400
+Chain is "100"
+Game is "Ended" #Red
+note bottom of Game: Betting period ended\nresolveGame() Phase 1 callable
+
+@404
+Chain is "101"
+State is "Calculating"
+note bottom of State: Phase 1 called:\ntargetRound = lastRound + 3\ncommitBlock = 101
+
+@408
+Chain is "102"
+note bottom of Chain: Typical: drand pulse\navailable in 1-2 blocks
+
+@412
+Chain is "103"
+State is "Resolved" #LightGreen
+note bottom of State: Phase 2 called:\nrandomness obtained\nactualEndBlock set\nwinner determined
+
+@enduml

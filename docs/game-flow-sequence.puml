@@ -1,0 +1,145 @@
+@startuml TAO Casino Game Flow with Drand Randomness
+
+title TAO Casino - Game Flow Sequence Diagram
+footer Generated for design review and community consensus
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor "User/Resolver" as User
+participant "TAO_Casino\nContract" as Casino
+participant "Storage Precompile\n(0x807)" as Storage
+database "Drand Pallet\nStorage" as DrandStorage
+participant "Offchain Worker" as OCW
+participant "Drand API\n(External)" as DrandAPI
+
+== Background: Drand Pulse Ingestion (Continuous) ==
+
+note over DrandAPI: Produces pulse every 3 seconds\n(round N, N+1, N+2, ...)
+
+loop Every Bittensor block (~12 seconds)
+    OCW -> DrandAPI: GET /public/latest
+    DrandAPI --> OCW: Pulse(round, randomness, signature)
+    OCW -> OCW: Verify BLS signature
+    OCW -> DrandStorage: write_pulse(pulse)
+    note right: Updates:\n- Pulses[round] = pulse\n- LastStoredRound = round
+end
+
+== Phase 1: Game Creation & Betting (100 blocks, ~20 min) ==
+
+User -> Casino: startNewGame()
+activate Casino
+Casino -> Casino: Create game\nstartBlock = now\nendBlock = now + 100
+Casino --> User: GameCreated(gameId, startBlock, endBlock)
+deactivate Casino
+
+note over Casino: BETTING PHASE\n(blocks 0-100)\n\nFinal Call Window:\nblocks 75-100
+
+loop During betting period
+    User -> Casino: placeBet(gameId, Side.Red/Blue)
+    activate Casino
+    Casino -> Casino: Record bet with placedAtBlock
+    Casino --> User: BetPlaced(gameId, side, amount)
+    deactivate Casino
+end
+
+== Phase 2: Resolution Phase 1 - Commit to Drand Round ==
+
+note over User: block.number >= endBlock (100)
+
+User -> Casino: resolveGame(gameId) [Phase 1]
+activate Casino
+
+Casino -> Storage: staticcall(DRAND_LAST_ROUND_KEY)
+activate Storage
+Storage -> DrandStorage: Read LastStoredRound
+DrandStorage --> Storage: roundNumber (e.g., 12345)
+Storage --> Casino: bytes(roundNumber)
+deactivate Storage
+
+Casino -> Casino: Decode u64 little-endian\nlastRound = 12345
+
+alt lastRound == 0 (Drand completely unavailable)
+    Casino -> Casino: _cancelGame("Drand not available")
+    Casino --> User: GameCancelled(gameId)
+else lastRound > 0
+    Casino -> Casino: targetDrandRound = lastRound + 3\ncommitBlock = block.number\nphase = Calculating
+    Casino --> User: DrandRoundCommitted(gameId, 12348, commitBlock)
+end
+
+deactivate Casino
+
+note over Casino: TARGET: Round 12348\nCommitted at block N\nTimeout at block N + 7200
+
+== Phase 3: Resolution Phase 2 - Finalize with Randomness ==
+
+note over User: Wait for drand round 12348 to be available
+
+User -> Casino: resolveGame(gameId) [Phase 2]
+activate Casino
+
+Casino -> Casino: Check timeout:\nblock.number > commitBlock + 7200?
+
+alt TIMEOUT (> 7200 blocks / ~24 hours)
+    Casino -> Casino: _cancelGame("Drand pulse timeout")
+    Casino --> User: DrandTimeoutCancelled(gameId)\nGameCancelled(gameId)
+else NOT TIMEOUT
+    Casino -> Casino: Build storage key:\nprefix + blake2_128(round) + round
+    
+    Casino -> Storage: staticcall(pulseKey)
+    activate Storage
+    Storage -> DrandStorage: Read Pulses[12348]
+    
+    alt Pulse NOT yet available
+        DrandStorage --> Storage: None
+        Storage --> Casino: empty bytes []
+        deactivate Storage
+        Casino --> User: revert WaitingForRandomness()
+        note right: User must retry later\n(typically 1-2 blocks)
+    else Pulse available
+        DrandStorage --> Storage: SCALE-encoded Pulse
+        Storage --> Casino: bytes(pulse data)
+        deactivate Storage
+        
+        Casino -> Casino: Decode SCALE:\n- skip round (8 bytes)\n- read compact length\n- extract 32-byte randomness
+        
+        alt Randomness == bytes32(0) [BUG: 2^-256 edge case]
+            Casino --> User: revert WaitingForRandomness()
+            note right #FF6666: FALSE NEGATIVE!\nPulse exists but\nrandomness happens to be 0
+        else Randomness != bytes32(0)
+            Casino -> Casino: actualEndBlock = \n(endBlock - 25) + (randomness % 25)
+            
+            Casino -> Casino: _calculateValidPools():\nMark bets after actualEndBlock as "late"
+            
+            Casino --> User: ActualEndBlockSet(gameId, actualEndBlock)
+            
+            alt Insufficient valid participation
+                Casino -> Casino: _cancelGame("Insufficient participation")
+                Casino --> User: GameCancelled(gameId)
+            else Valid game
+                Casino -> Casino: winner = minority pool\nphase = Resolved
+                Casino --> User: GameResolved(gameId, winner)
+            end
+        end
+    end
+end
+
+deactivate Casino
+
+== Phase 4: Claims ==
+
+User -> Casino: claimWinnings(gameId, side)
+activate Casino
+
+alt Late bet (isLateBet == true)
+    Casino --> User: Full refund (LateBetRefunded)
+else Winner
+    Casino --> User: Payout from pool (WinningsClaimed)
+else Loser
+    Casino --> User: Nothing (bet lost)
+end
+
+deactivate Casino
+
+@enduml

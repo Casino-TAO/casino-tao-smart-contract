@@ -1,0 +1,117 @@
+@startuml Drand Failure Scenarios
+
+title TAO Casino - Drand Failure Scenarios
+footer Edge cases and failure handling
+
+skinparam backgroundColor #FEFEFE
+skinparam noteBackgroundColor #FFFFCC
+
+actor "Resolver" as User
+participant "TAO_Casino" as Casino
+participant "Storage\nPrecompile" as Storage
+database "Drand Pallet" as Drand
+
+== Scenario 1: Happy Path (Typical ~1-2 blocks wait) ==
+
+note over Drand: LastStoredRound = 12345\nPulse 12345 available
+
+User -> Casino: resolveGame() [Phase 1]
+Casino -> Storage: read LastStoredRound
+Storage --> Casino: 12345
+Casino -> Casino: targetRound = 12348\ncommitBlock = 1000
+Casino --> User: DrandRoundCommitted(12348)
+
+note over User: ~12-24 seconds later\n(1-2 blocks)
+
+note over Drand: Offchain worker has\nfetched rounds 12346-12350
+
+User -> Casino: resolveGame() [Phase 2]
+Casino -> Storage: read Pulses[12348]
+Storage --> Casino: Pulse data (41+ bytes)
+Casino -> Casino: Extract randomness\nDetermine actualEndBlock\nResolve game
+Casino --> User: GameResolved(winner)
+
+note over Casino #90EE90: SUCCESS\nGame resolved in ~2 blocks
+
+== Scenario 2: Brief Delay (Offchain worker behind) ==
+
+note over Drand: LastStoredRound = 12345\nDrand API has rounds up to 12355\nOffchain worker is catching up
+
+User -> Casino: resolveGame() [Phase 1]
+Casino -> Storage: read LastStoredRound
+Storage --> Casino: 12345
+Casino -> Casino: targetRound = 12348
+Casino --> User: DrandRoundCommitted(12348)
+
+User -> Casino: resolveGame() [Phase 2]
+Casino -> Storage: read Pulses[12348]
+Storage --> Casino: empty [] (not yet available)
+Casino --> User: revert WaitingForRandomness()
+
+note over User: Wait ~12 seconds (1 block)
+
+note over Drand: Offchain worker catches up\nPulses 12346-12350 now stored
+
+User -> Casino: resolveGame() [Phase 2] retry
+Casino -> Storage: read Pulses[12348]
+Storage --> Casino: Pulse data
+Casino --> User: GameResolved(winner)
+
+note over Casino #90EE90: SUCCESS\nGame resolved after retry
+
+== Scenario 3: Extended Outage (Hours) ==
+
+note over Drand #FFCCCC: Offchain worker stuck\nor Drand API down\nNo new pulses for hours
+
+User -> Casino: resolveGame() [Phase 1]
+Casino -> Storage: read LastStoredRound
+Storage --> Casino: 12345
+Casino -> Casino: targetRound = 12348\ncommitBlock = 1000
+Casino --> User: DrandRoundCommitted(12348)
+
+loop Multiple retry attempts over hours
+    User -> Casino: resolveGame() [Phase 2]
+    Casino -> Storage: read Pulses[12348]
+    Storage --> Casino: empty []
+    Casino --> User: revert WaitingForRandomness()
+    note over User: Wait and retry...
+end
+
+note over User: Eventually: block.number > 1000 + 7200
+
+User -> Casino: resolveGame() [Phase 2]
+Casino -> Casino: block.number (8201) > commitBlock (1000) + 7200
+Casino -> Casino: TIMEOUT TRIGGERED
+Casino -> Casino: _cancelGame()\nReturn all fees to gameBalance
+Casino --> User: DrandTimeoutCancelled()\nGameCancelled("Drand pulse timeout")
+
+note over Casino #FFCCCC: CANCELLED\nAll bets refundable\nNo fees taken
+
+== Scenario 4: Drand Completely Unavailable at Start ==
+
+note over Drand #FFCCCC: LastStoredRound = 0\n(Drand never initialized or wiped)
+
+User -> Casino: resolveGame() [Phase 1]
+Casino -> Storage: read LastStoredRound
+Storage --> Casino: 0
+Casino -> Casino: lastRound == 0\nDrand not available
+Casino -> Casino: _cancelGame("Drand not available")
+Casino --> User: GameCancelled("Drand not available")
+
+note over Casino #FFCCCC: CANCELLED IMMEDIATELY\nAll bets refundable
+
+== Scenario 5: THE BUG - Randomness is bytes32(0) ==
+
+note over Drand: Pulse 12348 exists\nBut randomness = 0x000...000\n(probability: 2^-256)
+
+User -> Casino: resolveGame() [Phase 2]
+Casino -> Storage: read Pulses[12348]
+Storage --> Casino: Pulse(round=12348, randomness=0x00..00, sig=...)
+Casino -> Casino: Decode randomness\nrandomness == bytes32(0)
+Casino --> User: revert WaitingForRandomness()
+
+note over Casino #FF6666: BUG: FALSE NEGATIVE\nPulse exists but treated as unavailable\nGame stuck until timeout (24h)\nthen cancelled unfairly
+
+note over Casino: FIX NEEDED:\nReturn (bool exists, bytes32 randomness)\ninstead of using 0 as sentinel
+
+@enduml
