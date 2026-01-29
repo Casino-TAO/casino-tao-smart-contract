@@ -1,0 +1,52 @@
+@startuml Timing Overview
+
+title TAO Casino - Timing Overview
+
+skinparam backgroundColor #FEFEFE
+skinparam defaultTextAlignment center
+
+rectangle "**GAME TIMELINE**" {
+    
+    rectangle "Betting Phase\n(100 blocks / ~20 min)" as Betting #LightGreen {
+        rectangle "Blocks 0-74\nNormal bets" as Early #White
+        rectangle "Blocks 75-99\n**Final Call**\n(may be late)" as FinalCall #Orange
+    }
+    
+    rectangle "Resolution" as Resolution #LightYellow {
+        rectangle "Block 100+\n**Phase 1**\nCommit to\ndrand round" as Phase1 #Yellow
+        rectangle "Block 101-102+\n**Phase 2**\nGet randomness\nDetermine winner" as Phase2 #Gold
+    }
+    
+    rectangle "Claims\n(Block 103+)" as Claims #LightBlue
+}
+
+Early -right-> FinalCall
+FinalCall -right-> Phase1
+Phase1 -right-> Phase2
+Phase2 -right-> Claims
+
+note bottom of Betting
+  Users place bets on Red or Blue
+  1.5% fee collected
+end note
+
+note bottom of FinalCall
+  Bets here may be marked "late"
+  and refunded if placed after
+  the randomly selected actualEndBlock
+end note
+
+note bottom of Phase1
+  Reads LastStoredRound from drand
+  Commits to targetRound = lastRound + 3
+  Transitions to "Calculating" phase
+end note
+
+note bottom of Phase2
+  Reads drand pulse for targetRound
+  If not available: revert (retry later)
+  If timeout (7200 blocks): cancel game
+  If available: determine winner
+end note
+
+@enduml
