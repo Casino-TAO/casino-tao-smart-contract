@@ -100,18 +100,17 @@ Casino --> User: GameCancelled("Drand not available")
 
 note over Casino #FFCCCC: CANCELLED IMMEDIATELY\nAll bets refundable
 
-== Scenario 5: THE BUG - Randomness is bytes32(0) ==
+== Scenario 5: Randomness is bytes32(0) - FIXED ==
 
 note over Drand: Pulse 12348 exists\nBut randomness = 0x000...000\n(probability: 2^-256)
 
 User -> Casino: resolveGame() [Phase 2]
 Casino -> Storage: read Pulses[12348]
 Storage --> Casino: Pulse(round=12348, randomness=0x00..00, sig=...)
-Casino -> Casino: Decode randomness\nrandomness == bytes32(0)
-Casino --> User: revert WaitingForRandomness()
+Casino -> Casino: Decode pulse\n(exists=true, randomness=0x00..00)
+Casino -> Casino: exists == true\nUse randomness (even if 0)
+Casino --> User: RandomnessUsed(gameId, 12348, 0x00..00)\nGameResolved(winner)
 
-note over Casino #FF6666: BUG: FALSE NEGATIVE\nPulse exists but treated as unavailable\nGame stuck until timeout (24h)\nthen cancelled unfairly
-
-note over Casino: FIX NEEDED:\nReturn (bool exists, bytes32 randomness)\ninstead of using 0 as sentinel
+note over Casino #90EE90: FIXED!\nNow uses (bool exists, bytes32 randomness)\nPulse existence checked separately\nfrom randomness value
 
 @enduml

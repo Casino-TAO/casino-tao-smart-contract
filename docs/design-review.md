@@ -60,9 +60,9 @@ This document summarizes the design for integrating drand randomness into the TA
 
 ## Identified Issues
 
-### Issue 1: Sentinel Value Bug (bytes32(0))
+### Issue 1: Sentinel Value Bug (bytes32(0)) - ✅ FIXED
 
-**Current Code:**
+**Original Code:**
 ```solidity
 function _getDrandRandomness(uint64 round) internal view returns (bytes32) {
     // ... decode pulse ...
@@ -81,7 +81,24 @@ if (randomness == bytes32(0)) {
 
 **Impact:** Game would be stuck for 24 hours then cancelled unfairly.
 
-**Fix:** Return a tuple `(bool exists, bytes32 randomness)` instead of using a sentinel value.
+**Fix Applied:** Returns a tuple `(bool exists, bytes32 randomness)` instead of using a sentinel value.
+
+```solidity
+// NEW CODE
+function _getDrandRandomness(uint64 round) internal view returns (bool exists, bytes32 randomness) {
+    // ... decode pulse ...
+    return (true, rand);  // Pulse exists, randomness can be any value
+}
+
+// In resolveGame:
+(bool pulseExists, bytes32 randomness) = _getDrandRandomness(game.targetDrandRound);
+if (!pulseExists) {
+    revert WaitingForRandomness();
+}
+// randomness is now valid even if it happens to be bytes32(0)
+```
+
+**Additional:** Added `RandomnessUsed` event for transparency.
 
 ### Issue 2: Blake2b-128 Implementation
 

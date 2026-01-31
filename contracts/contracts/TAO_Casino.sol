@@ -189,6 +189,7 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     event ActualEndBlockSet(uint256 indexed gameId, uint256 actualEndBlock, uint256 validRedPool, uint256 validBluePool);
     event LateBetRefunded(uint256 indexed gameId, address indexed bettor, Side side, uint256 amount);
     event DrandTimeoutCancelled(uint256 indexed gameId, uint64 targetDrandRound, uint256 blocksWaited);
+    event RandomnessUsed(uint256 indexed gameId, uint64 drandRound, bytes32 randomness);
 
     // ==================== CONSTRUCTOR ====================
     
@@ -343,16 +344,20 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             }
             
             // Try to get randomness from committed drand round
-            bytes32 randomness = _getDrandRandomness(game.targetDrandRound);
+            (bool pulseExists, bytes32 randomness) = _getDrandRandomness(game.targetDrandRound);
             
-            // If randomness not yet available, caller must wait and try again
-            if (randomness == bytes32(0)) {
+            // If pulse not yet available, caller must wait and try again
+            if (!pulseExists) {
                 revert WaitingForRandomness();
             }
+            
+            // Emit the randomness used for transparency/verification
+            emit RandomnessUsed(_gameId, game.targetDrandRound, randomness);
             
             uint256 finalCallStart = game.endBlock - FINAL_CALL_BLOCKS;
             
             // Use drand randomness to pick actual end block within final call window
+            // Note: randomness can be any value including bytes32(0), which is valid
             uint256 randomOffset = uint256(randomness) % FINAL_CALL_BLOCKS;
             game.actualEndBlock = finalCallStart + randomOffset;
             
@@ -801,15 +806,19 @@ contract TAOCasino is ReentrancyGuard, Ownable {
     
     /**
      * @notice Read a drand pulse and extract the randomness
+     * @dev Returns (exists, randomness) tuple to avoid sentinel value bug
+     *      where bytes32(0) could be valid randomness (probability 2^-256)
      * @param round The drand round to read
-     * @return randomness The 32-byte randomness (empty if pulse not available)
+     * @return exists True if pulse was found and decoded successfully
+     * @return randomness The 32-byte randomness (valid only if exists==true)
      */
-    function _getDrandRandomness(uint64 round) internal view returns (bytes32) {
+    function _getDrandRandomness(uint64 round) internal view returns (bool exists, bytes32 randomness) {
         bytes memory key = _buildDrandPulseKey(round);
         bytes memory data = _readSubstrateStorage(key);
         
+        // Storage returns empty bytes when key doesn't exist
         if (data.length == 0) {
-            return bytes32(0);
+            return (false, bytes32(0));
         }
         
         // Decode SCALE-encoded Pulse:
@@ -819,25 +828,17 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         
         // We need at least: 8 (round) + 1 (compact len) + 32 (randomness) = 41 bytes
         if (data.length < 41) {
-            return bytes32(0);
+            return (false, bytes32(0));
         }
         
         // Skip round (bytes 0-7)
         // Read compact length at byte 8
         uint8 compactLen = uint8(data[8]);
         
-        // For lengths 0-63, compact encoding is just the length byte
-        // For 32 bytes, compact = 0x80 (32 << 2 = 128 = 0x80) - wait, let me recalculate
-        // SCALE compact: if value < 64, encode as (value << 2) | 0b00
-        // For 32: 32 << 2 = 128 = 0x80... that doesn't fit in "single byte mode"
-        // Actually: for 0-63, mode 0: byte = value << 2
-        // For 32: 32 << 2 = 128, which has high bit set, so it's mode 1 (two bytes)
-        // Wait no - let me check SCALE compact again:
+        // SCALE compact encoding:
         // Mode 0 (single byte): bits [7:2] = value, bits [1:0] = 00. Range: 0-63
         // Mode 1 (two bytes): bits [15:2] = value, bits [1:0] = 01. Range: 64-16383
-        // For 32: fits in mode 0, so byte = 32 << 2 | 0 = 128 = 0x80
-        // Hmm, but 0x80 has the pattern XX where low 2 bits are 00, so:
-        // 0x80 = 0b10000000, low 2 bits = 00, so value = 0x80 >> 2 = 32. Correct!
+        // For 32: 32 << 2 = 128 = 0x80, low 2 bits = 00, so value = 0x80 >> 2 = 32
         
         // Decode compact length
         uint256 randomnessLen;
@@ -849,31 +850,33 @@ contract TAOCasino is ReentrancyGuard, Ownable {
             randomnessStart = 9;
         } else if ((compactLen & 0x03) == 1) {
             // Two byte mode
-            if (data.length < 10) return bytes32(0);
+            if (data.length < 10) return (false, bytes32(0));
             uint16 val = uint16(compactLen) | (uint16(uint8(data[9])) << 8);
             randomnessLen = val >> 2;
             randomnessStart = 10;
         } else {
             // Four byte or big integer mode - randomness shouldn't need this
-            return bytes32(0);
+            return (false, bytes32(0));
         }
         
-        // Validate length
+        // Validate length - randomness must be exactly 32 bytes
         if (randomnessLen != 32) {
-            return bytes32(0);
+            return (false, bytes32(0));
         }
         
         if (data.length < randomnessStart + 32) {
-            return bytes32(0);
+            return (false, bytes32(0));
         }
         
         // Extract 32-byte randomness
-        bytes32 randomness;
+        bytes32 rand;
         assembly ("memory-safe") {
-            randomness := mload(add(add(data, 32), randomnessStart))
+            rand := mload(add(add(data, 32), randomnessStart))
         }
         
-        return randomness;
+        // Pulse exists and was decoded successfully
+        // randomness can be any value including bytes32(0)
+        return (true, rand);
     }
     
     function _updateLeaderboard(address _user) internal {
@@ -1053,8 +1056,8 @@ contract TAOCasino is ReentrancyGuard, Ownable {
         canFinalize = false;
         
         if (game.phase == GamePhase.Calculating && game.targetDrandRound > 0) {
-            bytes32 randomness = _getDrandRandomness(game.targetDrandRound);
-            canFinalize = (randomness != bytes32(0));
+            (bool pulseExists, ) = _getDrandRandomness(game.targetDrandRound);
+            canFinalize = pulseExists;
         }
     }
     
@@ -1090,16 +1093,17 @@ contract TAOCasino is ReentrancyGuard, Ownable {
      * @return available True if the pulse is stored and readable
      */
     function isDrandRoundAvailable(uint64 round) external view returns (bool) {
-        bytes32 randomness = _getDrandRandomness(round);
-        return randomness != bytes32(0);
+        (bool exists, ) = _getDrandRandomness(round);
+        return exists;
     }
     
     /**
      * @notice Get randomness from a specific drand round (for debugging)
      * @param round The drand round
-     * @return randomness The 32-byte randomness (zero if not available)
+     * @return exists True if pulse was found
+     * @return randomness The 32-byte randomness (valid only if exists==true)
      */
-    function getDrandRandomness(uint64 round) external view returns (bytes32) {
+    function getDrandRandomness(uint64 round) external view returns (bool exists, bytes32 randomness) {
         return _getDrandRandomness(round);
     }
     
